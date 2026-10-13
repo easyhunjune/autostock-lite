@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autostock-lite"
+version = "0.1.0"
+description = "Read-only Korean equity research MCP server (OpenDART, optional Toss Securities)"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=2.0",
+  "jsonschema>=4",
+  "httpx>=0.27",
+  "rapidfuzz>=3.0",
+]
+
+[project.scripts]
+autostock-lite = "autostock_research.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
