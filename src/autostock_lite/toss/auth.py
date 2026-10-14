@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 import threading
 import time
 from typing import Callable
@@ -11,6 +12,9 @@ import httpx
 
 from .client import BASE_URL
 from ..status_codes import ErrorCode
+
+
+_OAUTH_ERROR_CODE = re.compile(r"[a-z_]{1,40}")
 
 
 class TossAuthError(RuntimeError):
@@ -86,11 +90,13 @@ class TossTokenProvider:
                 "현재 IP가 토스 Open API 허용 IP에 등록되지 않았습니다"
             )
         if response.status_code != 200:
+            # error는 서버가 정한 임의 문자열이다. OAuth2 오류 코드 모양일 때만 메시지에 싣는다.
             code = "unknown"
             try:
                 payload = response.json()
-                if isinstance(payload, dict) and isinstance(payload.get("error"), str):
-                    code = payload["error"]
+                error = payload.get("error") if isinstance(payload, dict) else None
+                if isinstance(error, str) and _OAUTH_ERROR_CODE.fullmatch(error):
+                    code = error
             except ValueError:
                 pass
             raise TossAuthError(

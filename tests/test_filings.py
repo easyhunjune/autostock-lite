@@ -6,6 +6,7 @@
 import asyncio
 from datetime import date
 import io
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -18,7 +19,7 @@ from autostock_lite.dart.filings import (
     DOC_ANNUAL, DOC_QUARTERLY, DOC_SECURITIES, DOC_UNKNOWN,
     Filing, FilingArchiveError, FilingArgumentError, FilingDocument, FilingEncodingError,
     FilingError, FilingSchemaError, classify_doc_type, diff_filing_sections,
-    get_filing_document, get_filing_section, list_filings, resolve_current_filings,
+    get_filing_document, get_filing_section, list_filings, normalize_sentences, resolve_current_filings,
 )
 from autostock_lite.mcp_runtime import create_live_runtime
 from autostock_lite.mcp_server import ToolArgumentsError
@@ -413,6 +414,128 @@ class TextStructureTests(unittest.TestCase):
         self.assertEqual(self.text("<P>A&amp;B &lt;C&gt;<!-- 숨김 주석 --> 끝&cr;이어짐</P>"), "A&B <C> 끝 이어짐")
         self.assertEqual(self.text("<TABLE><TR><TD>a\\b</TD><TD>x|y</TD></TR></TABLE>"), "| a\\\\b | x\\|y |")
 
+    def test_inline_tags_and_raw_line_breaks_stay_inside_the_line(self):
+        """줄은 블록 태그에서만 나온다. 인라인 태그는 지워지고 원문 줄바꿈은 공백이 된다."""
+        for body, expected in (
+            ('<P>당사는 <SPAN USERMARK="B">반도체</SPAN>를 만든다. 이익도 늘었다.</P>', "당사는 반도체를 만든다. 이익도 늘었다."),
+            ("<P>당사는 합성\n부품과\r\n   서비스를\r만든다.</P>", "당사는 합성 부품과 서비스를 만든다."),
+            (
+                '<p>A<b>굵게</b><I>기울임</I><u>밑줄</u><FONT COLOR="red">글꼴</FONT> H<sub>2</sub>O x<SUP>2</SUP> '
+                '<strong>강</strong><Em>조</Em> <a href="https://x.example.test/">링크</a></p>',
+                "A굵게기울임밑줄글꼴 H2O x2 강조 링크",
+            ),
+            # 인라인 목록 밖의 태그(BR, 이름이 비슷한 ABBR·BIG 포함)는 줄바꿈이다.
+            ("<P>가<BR/>나<B>다</B><ABBR>라</ABBR><BIG>마</BIG></P>", "가\n나다\n라\n마"),
+            ("<P>첫 문단</P><P>둘째 문단</P>\n<P>\n  셋째\n  문단\n</P>", "첫 문단\n둘째 문단\n셋째 문단"),
+            ("<TITLE>1. 사업의 개요</TITLE>\n<P>당사는\n<SPAN>부품</SPAN>을 만든다.</P>", "1. 사업의 개요\n당사는 부품을 만든다."),
+            (
+                "<P>앞 문장.</P>\n<TABLE>\n<TR>\n<TD><SPAN>a</SPAN></TD>\n<TD>b\nc</TD>\n</TR>\n</TABLE>\n<P>뒤 문장.</P>",
+                "앞 문장.\n| a | b c |\n뒤 문장.",
+            ),
+            ("앞<TABLE><TR><TD>a</TD><TD>b</TD></TR></TABLE>뒤", "앞\n| a | b |\n뒤"),
+            ("앞<TABLE><TR><TD></TD></TR></TABLE>뒤", "앞\n뒤"),
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(self.text(body), expected)
+        self.assertEqual(
+            normalize_sentences(self.text('<P>당사는 <SPAN USERMARK="B">반도체</SPAN>를 만든다. 이익도 늘었다.</P>')),
+            ("당사는 반도체를 만든다.", "이익도 늘었다."),
+        )
+        self.assertEqual(normalize_sentences(self.text("<P>당사는 합성\n부품과\n서비스를 만든다.</P>")), ("당사는 합성 부품과 서비스를 만든다.",))
+
+    def test_plain_text_members_keep_their_line_breaks(self):
+        # .txt 원문은 마크업이 아니다. 태그·엔티티·표 처리 없이 str.splitlines로 줄을 나누고,
+        # 줄마다 공백을 접고 빈 줄을 버린다.
+        for raw, expected in (
+            ("첫 줄\n둘째 <B>줄</B>\n\n셋째 줄", "첫 줄\n둘째 <B>줄</B>\n셋째 줄"),
+            ("첫 줄\r\n\r\n둘째 줄\r\n", "첫 줄\n둘째 줄"),
+            ("가\r나\r\n  \r\n다  ", "가\n나\n다"),
+            ("a < b and c > d\n&amp; &#10; &cr; <!-- 주석 --> <TABLE><TR><TD>x</TD></TR></TABLE>",
+             "a < b and c > d\n&amp; &#10; &cr; <!-- 주석 --> <TABLE><TR><TD>x</TD></TR></TABLE>"),
+            ("첫 줄" + chr(0x0C) + "둘째" + chr(0x2028) + "셋째" + chr(0x85) + "넷째", "첫 줄\n둘째\n셋째\n넷째"),
+            ("  a \t  b\t", "a b"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(read(zipped({"d.txt": raw})).text, expected)
+
+    def test_plain_text_long_whitespace_run_collapses(self):
+        raw = "II. 사업의 내용\n본문" + " " * 200_000 + "끝.\n"
+        payload = zipped({"d.txt": raw}, compression=zipfile.ZIP_STORED)
+        started = time.perf_counter()
+        document = read(payload)
+        # 넉넉한 상한이다. 예전 정규식은 이 입력에서 수십 초가 걸렸다.
+        self.assertLess(time.perf_counter() - started, 5.0)
+        self.assertEqual(document.text, "II. 사업의 내용\n본문 끝.")
+
+    def test_encoded_and_unicode_line_breaks_do_not_split_prose(self):
+        """엔티티로 적었거나 유니코드 줄 구분 문자인 줄바꿈도 마크업 안에서는 공백이다."""
+        self.assertEqual(self.text("<P>줄&#13;&#10;바꿈 엔티티.</P>"), "줄 바꿈 엔티티.")
+        self.assertEqual(normalize_sentences(self.text("<P>줄&#13;&#10;바꿈 엔티티.</P>")), ("줄 바꿈 엔티티.",))
+        self.assertEqual(self.text("<P>가 나" + chr(0x85) + "다 끝.</P>"), "가 나 다 끝.")
+        self.assertEqual(normalize_sentences(self.text("<P>가 나" + chr(0x85) + "다 끝.</P>")), ("가 나 다 끝.",))
+        encoded = ("&#10;", "&#xA;", "&#X0D;", "&#0010;", "&#x000a;", "&#12;", "&#8232;", "&#x2029;", "&NewLine;")
+        raw = tuple(chr(code) for code in (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029))
+        for line_break in encoded + raw:
+            with self.subTest(line_break=line_break):
+                text = self.text(f"<P>앞{line_break}뒤 문장.</P>")
+                self.assertEqual(text, "앞 뒤 문장.")
+                self.assertEqual(normalize_sentences(text), ("앞 뒤 문장.",))
+        # &#133;은 HTML5 규칙으로 줄임표가 된다(U+0085가 아니다). 줄바꿈이 아니므로 그대로 둔다.
+        self.assertEqual(self.text("<P>잠깐&#133; 다음.</P>"), "잠깐… 다음.")
+        # 표 처리가 넣는 줄 경계(빈 표, 닫히지 않은 표 태그)는 유지된다.
+        self.assertEqual(self.text("앞<TABLE><TR><TD></TD></TR></TABLE>뒤"), "앞\n뒤")
+
+    def test_section_text_and_sentences_see_the_same_lines(self):
+        body = (
+            "<SECTION-1><TITLE>II. 사업의 내용</TITLE>\n"
+            "<P>첫째&#10;문장.</P><P>둘째" + chr(0x2028) + "문장.</P>\n"
+            "<TABLE><TR><TD>a</TD><TD>b</TD></TR></TABLE>\n"
+            "<P>셋째&#x0C;문장.</P></SECTION-1>\n"
+            "<SECTION-1><TITLE>III. 재무에 관한 사항</TITLE><P>재무.</P></SECTION-1>"
+        )
+        section = get_filing_section(read(zipped({"d.xml": document_xml(body)})), section="사업의 내용")
+        self.assertEqual(section.text, "첫째 문장.\n둘째 문장.\n| a | b |\n셋째 문장.")
+        self.assertEqual(section.sentences, tuple(line for line in section.text.split("\n") if not line.startswith("| ")))
+        # 밖에서 만든 FilingDocument도 같다. 줄 경계는 LF·CRLF·CR이고 U+2028은 줄 안에 남는다.
+        external = annual_document(
+            "II. 사업의 내용\r\n본문 가" + chr(0x2028) + "나.\r\nIII. 재무에 관한 사항\r\n재무."
+        )
+        section = get_filing_section(external, section="사업의 내용")
+        self.assertEqual(section.text, "본문 가" + chr(0x2028) + "나.")
+        self.assertEqual(section.sentences, ("본문 가 나.",))
+
+    def test_bare_cr_external_text_still_splits_lines(self):
+        document = annual_document("II. 사업의 내용\r본문.\rIII. 재무에 관한 사항\r재무.")
+        section = get_filing_section(document, section="사업의 내용")
+        self.assertEqual((section.status, section.text, section.sentences), ("ok", "본문.", ("본문.",)))
+        self.assertEqual(normalize_sentences("가\r나\r\n다\n라"), ("가", "나", "다", "라"))
+
+    def test_long_whitespace_inside_a_heading_line(self):
+        gap = " " * 200_000
+        started = time.perf_counter()
+        identity = filings._heading_identity("1. 제목" + gap + "x")
+        # 넉넉한 상한이다. 예전 정규식은 이 줄에서 분 단위가 걸렸다.
+        self.assertLess(time.perf_counter() - started, 5.0)
+        self.assertEqual(identity, ("제목" + gap + "x", 2))
+        self.assertEqual(filings._heading_identity("III. 재무" + gap + "x"), ("재무" + gap + "x", 1))
+        # 긴 공백이 든 III장 제목이 제목으로 인식돼 사업의 내용 절을 끝낸다.
+        document = annual_document("II. 사업의 내용\n본문.\nIII. 재무" + gap + "x\n재무.")
+        self.assertEqual(get_filing_section(document, section="사업의 내용").text, "본문.")
+        # 마크업의 &nbsp; 반복도 NFKC 뒤 같은 경로를 탄다.
+        body = "<P>II. 사업의 내용</P><P>본문.</P><P>III. 재무" + "&nbsp;" * 20_000 + "x</P><P>재무.</P>"
+        marked_up = read(zipped({"d.xml": document_xml(body)}, compression=zipfile.ZIP_STORED))
+        self.assertEqual(get_filing_section(marked_up, section="사업의 내용").text, "본문.")
+
+    def test_section_sentences_with_inline_markup(self):
+        body = (
+            "<SECTION-1><TITLE>II. 사업의 내용</TITLE>\n<SECTION-2><TITLE>1. 사업의 개요</TITLE>\n"
+            '<P>당사는 <SPAN USERMARK="B">반도체</SPAN>를\n만든다. 이익도 늘었다.</P>\n</SECTION-2></SECTION-1>\n'
+            "<SECTION-1><TITLE>III. 재무에 관한 사항</TITLE><P>재무.</P></SECTION-1>"
+        )
+        section = get_filing_section(read(zipped({"d.xml": document_xml(body)})), section="사업의 내용")
+        self.assertEqual(section.text, "1. 사업의 개요\n당사는 반도체를 만든다. 이익도 늘었다.")
+        self.assertEqual(section.sentences, ("1. 사업의 개요", "당사는 반도체를 만든다.", "이익도 늘었다."))
+
     def test_section_text_and_sentences(self):
         document = read(zipped({"d.xml": document_xml(ANNUAL_BODY)}))
         section = get_filing_section(document, section="사업의 내용")
@@ -422,6 +545,11 @@ class TextStructureTests(unittest.TestCase):
         self.assertIn("수출 비중은 절반이다.", section.sentences)
         self.assertFalse([sentence for sentence in section.sentences if "|" in sentence or "1,000" in sentence])
         self.assertNotIn("재무 내용.", section.text)
+        # 제목 줄은 다음 문장에 붙지 않고, 목록 표식의 마침표에서 끊기지도 않는다.
+        self.assertEqual(section.sentences, (
+            "1. 사업의 개요", "당사는 합성 부품을 만든다.", "주요 고객은 가상 고객사다.",
+            "수출 비중은 절반이다.", "2. 주요 제품", "제품은 하나다.",
+        ))
 
     def test_section_statuses(self):
         document = read(zipped({"d.xml": document_xml(ANNUAL_BODY)}))
@@ -460,6 +588,73 @@ class TextStructureTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(get_filing_section(annual_document(text), section="사업의 내용").status, "section-not-found")
 
+    def test_glued_markers_from_inline_tags_are_headings(self):
+        # 인라인 태그가 지워지면 표식과 제목이 공백 없이 붙는다.
+        document = read(zipped({"d.xml": document_xml(
+            "<P><SPAN>IV.</SPAN><SPAN>이사의 경영진단 및 분석의견</SPAN></P><P>본문.</P><TITLE>V. 감사인</TITLE>"
+        )}))
+        self.assertEqual(document.text, "IV.이사의 경영진단 및 분석의견\n본문.\nV. 감사인")
+        section = get_filing_section(document, section="이사의 경영진단 및 분석의견")
+        self.assertEqual((section.status, section.text, section.sentences), ("ok", "본문.", ("본문.",)))
+        document = read(zipped({"d.xml": document_xml(
+            "<P><B>II.</B>사업의 내용</P><P>본문.</P><P>III. 재무에 관한 사항</P><P>재무.</P>"
+        )}))
+        section = get_filing_section(document, section="사업의 내용")
+        self.assertEqual((section.status, section.text), ("ok", "본문."))
+
+    def test_heading_marker_spacing_rules(self):
+        for line, title, level in (
+            ("IV.이사의 경영진단 및 분석의견", "이사의 경영진단 및 분석의견", 1),
+            ("II.사업의 내용", "사업의 내용", 1),
+            ("가.주요 제품", "주요 제품", 3),
+            ("제2장.사업의 내용", "사업의 내용", 1),
+            ("제 2 장 사업의 내용", "사업의 내용", 1),
+            ("제2장. 사업의 내용", "사업의 내용", 1),
+            ("제 2 장.사업의 내용", "사업의 내용", 1),
+            ("제3편 기타", "기타", 1),
+            ("II. 사업의 내용", "사업의 내용", 1),
+            ("가. 주요 제품", "주요 제품", 3),
+            ("1. 사업의 개요", "사업의 개요", 2),
+            ("1.1 세부", "세부", 3),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(filings._heading_identity(line), (title, level))
+        for line in (
+            # 제N장/편은 공백이나 "마침표+한글"이 있어야 한다. 붙은 참조 문장은 제목이 아니다.
+            "제2장사업의 내용", "제2장에서 설명한 바와 같이 당사는", "제3편의 내용", "제1장비 투자", "제 5 장」", "제1장.",
+            # 붙은 로마 숫자·한글 순번 뒤에는 한글 음절만 올 수 있다.
+            "X.(주)가 공급했다", "C.,", "I..", "V...", "L.「", "IV.-이사", "IV.:이사", "다.(주석 3 참조)", "다.」",
+            "C.E.O.가 바뀌었다.", "I.R. 활동을 했다.", "X.509 인증서", "L.A.에서",
+            # 숫자 표식 뒤에는 공백이 있어야 하고, 표식만 있는 줄은 제목이 아니다.
+            "3.5% 늘었다", "1.사업의 내용", "가.",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(filings._heading_identity(line), (line, None))
+
+    def test_glued_korean_markers_do_not_swallow_prose(self):
+        # 시작: 제목이 절 이름과 같아야 하므로 "다.그리고 …"나 "가."만 있는 줄은 절을 시작하지 않는다.
+        document = annual_document("다.그리고 사업의 내용\n가.\n본문.")
+        self.assertEqual(get_filing_section(document, section="사업의 내용").status, "section-not-found")
+        # 끝: 붙은 표식 뒤가 한글이 아닌 줄은 1레벨 제목이 아니므로 절을 끝내지 않는다.
+        document = annual_document(
+            "II. 사업의 내용\n본문.\nC.E.O.가 바뀌었다.\nX.(주)가 공급했다.\nIV.-이사회 결의로 바꿨다.\n"
+            "III. 재무에 관한 사항\n재무."
+        )
+        self.assertEqual(
+            get_filing_section(document, section="사업의 내용").text,
+            "본문.\nC.E.O.가 바뀌었다.\nX.(주)가 공급했다.\nIV.-이사회 결의로 바꿨다.",
+        )
+
+    def test_chapter_cross_references_do_not_end_a_section(self):
+        document = annual_document(
+            "II. 사업의 내용\n본문 1.\n제2장에서 설명한 바와 같이 수요가 늘었다.\n본문 2.\nIII. 재무에 관한 사항\n재무."
+        )
+        section = get_filing_section(document, section="사업의 내용")
+        self.assertEqual((section.status, section.text), ("ok", "본문 1.\n제2장에서 설명한 바와 같이 수요가 늘었다.\n본문 2."))
+        # 붙은 로마 숫자 제목은 절을 제대로 끝낸다.
+        glued = annual_document("II. 사업의 내용\n본문.\nIII.재무에 관한 사항\n재무.")
+        self.assertEqual(get_filing_section(glued, section="사업의 내용").text, "본문.")
+
     def test_securities_registration_sections(self):
         document = read(zipped({"d.xml": document_xml(REGISTRATION_BODY)}), REGISTRATION_ROW)
         self.assertEqual(document.doc_type, DOC_SECURITIES)
@@ -467,6 +662,46 @@ class TextStructureTests(unittest.TestCase):
         self.assertEqual(get_filing_section(document, section="회사위험").sentences, ("가상 공장이 하나뿐이다.",))
         self.assertEqual(get_filing_section(document, section="기타위험").status, "section-not-found")
         self.assertEqual(get_filing_section(document, section="사업의 내용").status, "section-not-applicable")
+
+
+class SentenceTests(unittest.TestCase):
+    """줄바꿈은 문장 경계다. 줄 맨 앞 목록 표식의 마침표는 문장 끝이 아니다."""
+
+    def test_line_breaks_are_sentence_boundaries(self):
+        for text, expected in (
+            ("1. 사업의 개요\n당사는 부품을 만든다.", ("1. 사업의 개요", "당사는 부품을 만든다.")),
+            ("가\n나", ("가", "나")),
+            ("가. 주요 제품\n제품은 하나다. 수출 비중은 절반이다.", ("가. 주요 제품", "제품은 하나다.", "수출 비중은 절반이다.")),
+            ("매출은 3.5% 늘었다. 이익도 늘었다.", ("매출은 3.5% 늘었다.", "이익도 늘었다.")),
+            ("첫 줄\r\n\n\n  둘째\t\t줄  \n \t \n셋째 줄", ("첫 줄", "둘째 줄", "셋째 줄")),
+            ("물음인가? 그렇다! 끝。 다음", ("물음인가?", "그렇다!", "끝。", "다음")),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(normalize_sentences(text), expected)
+
+    def test_list_markers_keep_the_heading_together(self):
+        # NFKC가 먼저 적용되므로 Ⅰ·Ⅱ는 I·II로, ①은 1로 나온다.
+        for text, expected in (
+            ("1. 사업의 개요", ("1. 사업의 개요",)),
+            ("12. 기타 사항\n본문.", ("12. 기타 사항", "본문.")),
+            ("나. 판매 경로\n본문.", ("나. 판매 경로", "본문.")),
+            ("Ⅰ. 회사의 개요\n본문.", ("I. 회사의 개요", "본문.")),
+            ("II. 사업의 내용\n본문.", ("II. 사업의 내용", "본문.")),
+            ("(1) 산업의 특성\n본문.", ("(1) 산업의 특성", "본문.")),
+            ("① 주요 제품\n본문.", ("1 주요 제품", "본문.")),
+            ("1.2. 세부 항목. 다음 문장.", ("1.2. 세부 항목.", "다음 문장.")),
+            ("가. 제목이다. 본문이다.", ("가. 제목이다.", "본문이다.")),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(normalize_sentences(text), expected)
+
+    def test_tables_and_note_markers_are_still_removed(self):
+        self.assertEqual(normalize_sentences("| a | b |\n본문이다.\n| 1,000 | 2,000 |"), ("본문이다.",))
+        self.assertEqual(normalize_sentences("매출이 늘었다 주석 3) 이익도 늘었다."), ("매출이 늘었다 이익도 늘었다.",))
+        # 표식 제거는 줄바꿈을 넘지 않는다.
+        self.assertEqual(normalize_sentences("본문 각주\n12) 다음 줄"), ("본문 각주", "12) 다음 줄"))
+        self.assertEqual(normalize_sentences(""), ())
+        self.assertEqual(normalize_sentences("\n \n| a | b |\n"), ())
 
 
 class DiffTests(unittest.TestCase):
@@ -502,6 +737,21 @@ class DiffTests(unittest.TestCase):
                 diff_filing_sections(self.document(self.BEFORE), other, section=section)
             self.assertIs(type(caught.exception), FilingError)
             self.assertEqual(caught.exception.code.value, "filing-error")
+
+    def test_a_change_inside_marked_up_prose_replaces_the_whole_sentence(self):
+        before = '당사는 <SPAN USERMARK="B">합성</SPAN> 부품을\n만든다. 주요 고객은 가상 고객사다.'
+        after = '당사는 <SPAN USERMARK="B">합성</SPAN> 부품을\n판다. 주요 고객은 가상 고객사다.'
+        diff = diff_filing_sections(self.document(before), self.document(after, ANNUAL_FIX), section="사업의 내용")
+        self.assertEqual(diff.blocks, ({"kind": "replace", "before": ("당사는 합성 부품을 만든다.",), "after": ("당사는 합성 부품을 판다.",)},))
+
+    def test_a_change_under_a_heading_is_its_own_sentence(self):
+        before = annual_document("II. 사업의 내용\n1. 사업의 개요\n당사는 부품을 만든다.\n가. 주요 제품\n제품은 하나다.\nIII. 재무에 관한 사항\n재무.")
+        after = annual_document("II. 사업의 내용\n1. 사업의 개요\n당사는 부품을 판다.\n가. 주요 제품\n제품은 하나다.\nIII. 재무에 관한 사항\n재무.")
+        diff = diff_filing_sections(before, after, section="사업의 내용")
+        self.assertEqual(diff.blocks, ({"kind": "replace", "before": ("당사는 부품을 만든다.",), "after": ("당사는 부품을 판다.",)},))
+        renamed = annual_document("II. 사업의 내용\n1. 사업 개요\n당사는 부품을 만든다.\n가. 주요 제품\n제품은 하나다.\nIII. 재무에 관한 사항\n재무.")
+        diff = diff_filing_sections(before, renamed, section="사업의 내용")
+        self.assertEqual(diff.blocks, ({"kind": "replace", "before": ("1. 사업의 개요",), "after": ("1. 사업 개요",)},))
 
 
 class FilingToolTests(IsolatedCase):

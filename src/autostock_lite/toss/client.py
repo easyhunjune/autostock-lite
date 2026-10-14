@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+import math
 import re
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -16,6 +17,8 @@ from ..status_codes import InvalidArgumentError
 
 BASE_URL = "https://openapi.tossinvest.com"
 KST = timezone(timedelta(hours=9))
+# Retry-After 대기와 X-RateLimit-Reset 차단 시간이 함께 쓰는 상한(초).
+RETRY_AFTER_CAP_SECONDS = 30.0
 
 
 class ReadonlyPathError(ValueError):
@@ -126,43 +129,53 @@ class RateLimiter:
         }
 
     def acquire(self, group: RateLimitGroup) -> None:
+        # 한 번의 대기는 RETRY_AFTER_CAP_SECONDS를 넘지 않는다(헤더 검증을 빠져나간 값에 대한 안전판).
         bucket = self.buckets[group]
         now = self.clock.now()
         if now < bucket.blocked_until:
-            self.clock.sleep(bucket.blocked_until - now)
+            self.clock.sleep(min(bucket.blocked_until - now, RETRY_AFTER_CAP_SECONDS))
             now = self.clock.now()
         bucket.refill(now)
         if bucket.tokens < 1:
-            delay = (1 - bucket.tokens) / bucket.rate
+            delay = min((1 - bucket.tokens) / bucket.rate, RETRY_AFTER_CAP_SECONDS)
             self.clock.sleep(delay)
             bucket.refill(self.clock.now())
         bucket.tokens -= 1
 
     def update_from_headers(self, group: RateLimitGroup, headers: Mapping[str, str]) -> None:
-        normalized = {key.lower(): value for key, value in headers.items()}
+        """응답 헤더로 버킷을 보정한다. 헤더 내용 때문에 예외를 내지 않는다.
+
+        세 헤더는 따로 읽는다. 숫자가 아니거나 NaN·무한대이거나 범위를 벗어난
+        헤더(Limit < 1, Remaining < 0, Reset < 0)는 무시하고 버킷의 해당 부분을
+        그대로 둔다. Limit이 1 미만이면 토큰이 1에 닿지 못하거나 대기가 사실상
+        무한해지므로 받지 않는다. Reset은 RETRY_AFTER_CAP_SECONDS를 넘지 않게 자른다.
+        """
+        normalized = {str(key).lower(): value for key, value in headers.items()}
         bucket = self.buckets[group]
         now = self.clock.now()
-        limit_text = normalized.get("x-ratelimit-limit")
-        remaining_text = normalized.get("x-ratelimit-remaining")
-        reset_text = normalized.get("x-ratelimit-reset")
-        if limit_text is not None:
-            limit = float(limit_text)
-            if limit <= 0:
-                raise ValueError("X-RateLimit-Limit는 양수여야 한다")
+        limit = _finite_header(normalized.get("x-ratelimit-limit"))
+        remaining = _finite_header(normalized.get("x-ratelimit-remaining"))
+        reset_after_seconds = _finite_header(normalized.get("x-ratelimit-reset"))
+        if limit is not None and limit >= 1:
             bucket.rate = limit
             bucket.capacity = limit
             bucket.tokens = min(bucket.tokens, limit)
-        if remaining_text is not None:
-            remaining = float(remaining_text)
-            if remaining < 0:
-                raise ValueError("X-RateLimit-Remaining은 음수가 될 수 없다")
+        if remaining is not None and remaining >= 0:
             bucket.tokens = min(bucket.capacity, remaining)
             bucket.updated_at = now
-        if reset_text is not None and bucket.tokens < 1:
-            reset_after_seconds = float(reset_text)
-            if reset_after_seconds < 0:
-                raise ValueError("X-RateLimit-Reset은 음수가 될 수 없다")
-            bucket.blocked_until = now + reset_after_seconds
+        if reset_after_seconds is not None and reset_after_seconds >= 0 and bucket.tokens < 1:
+            bucket.blocked_until = now + min(reset_after_seconds, RETRY_AFTER_CAP_SECONDS)
+
+
+def _finite_header(text: str | None) -> float | None:
+    """헤더 값을 유한한 float로 읽는다. 읽을 수 없거나 NaN·무한대면 None."""
+    if text is None:
+        return None
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 @dataclass(frozen=True)
@@ -472,7 +485,7 @@ def retry_delay(
     *,
     retry_after: str | None,
     jitter: Callable[[], float] = lambda: 0.0,
-    cap_seconds: float = 30.0,
+    cap_seconds: float = RETRY_AFTER_CAP_SECONDS,
 ) -> float:
     if attempt < 0:
         raise ValueError("attempt는 0 이상이어야 한다")

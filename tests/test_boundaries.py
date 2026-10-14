@@ -35,7 +35,7 @@ from autostock_lite.status_codes import (
     ERROR_CODES, UNAVAILABLE_CODES, ErrorCode, InvalidArgumentError,
 )
 from autostock_lite.toss.auth import TossAuthError, TossIpNotAllowed
-from autostock_lite.toss.live import TossLiveError, TossLiveIpNotAllowed, TossRateLimited
+from autostock_lite.toss.live import TossLiveError, TossLiveIpNotAllowed, TossRateLimited, TossRequestRejected
 from autostock_lite.toss.models import StrictModelError
 from test_smoke import DART_KEY, ROOT, TOSS_SECRET, IsolatedCase
 
@@ -285,6 +285,7 @@ class ErrorCodeRegistryTests(unittest.TestCase):
             TossIpNotAllowed: ("unavailable", "toss-ip-not-allowed"),
             TossLiveIpNotAllowed: ("unavailable", "toss-ip-not-allowed"),
             TossRateLimited: ("unavailable", "toss-rate-limited"),
+            TossRequestRejected: ("blocked", "toss-request-rejected"),
             TossLiveError: ("unavailable", "toss-request-failed"),
             RuntimeError: ("unavailable", "internal-error"),
         }

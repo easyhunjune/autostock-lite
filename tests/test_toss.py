@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime, timezone
 import io
 import json
+import math
 import os
 import unittest
 from unittest.mock import patch
@@ -15,20 +16,55 @@ from urllib.parse import parse_qs
 import httpx
 
 from autostock_lite.cli import doctor
+from autostock_lite.dart.client import DartLiveError, DartReadonlyClient
 from autostock_lite.mcp_runtime import create_live_runtime, run_live_stdio
 from autostock_lite.provenance import MASK
 from autostock_lite.toss import live, session_lock
 from autostock_lite.toss.auth import AccessToken, TossAuthError, TossIpNotAllowed, TossTokenProvider
 from autostock_lite.toss.client import (
-    BASE_URL, Operation, PreparedRequest, RateLimitGroup, RateLimiter, TossReadonlyClient, retry_delay,
+    BASE_URL, RETRY_AFTER_CAP_SECONDS, Operation, PreparedRequest, RateLimitGroup, RateLimiter,
+    TossReadonlyClient, retry_delay,
 )
-from autostock_lite.toss.live import TossLiveClient, TossLiveError, TossLiveIpNotAllowed, TossRateLimited
+from autostock_lite.toss.live import (
+    TossLiveClient, TossLiveError, TossLiveIpNotAllowed, TossRateLimited, TossRequestRejected,
+)
 from autostock_lite.toss.session_lock import TossSessionBusy, TossSessionLock, TossSessionReentryError
 from test_smoke import DART_KEY, SECRETS, TOSS_ID, TOSS_SECRET, IsolatedCase
 
 
 ACCESS_TOKEN = "synthetic-access-0001"
 DART_TOOL_COUNT, ALL_TOOL_COUNT = 13, 27
+# 거부 응답 본문에만 들어 있는 비밀이 아닌 표지. 예외 메시지에 나오면 본문이 샌 것이다.
+REJECTION_BODY_MARKER = "synthetic-rejection-body-0001"
+# 설정값이 아니라 마스킹 대상이 아닌 가짜 비밀. 토큰 발급 오류 본문에만 넣는다.
+UNCONFIGURED_SECRET = "synthetic-unconfigured-secret-0001"
+REJECTED_STATUSES = (400, 404, 405, 409, 410, 412, 413, 415, 422)
+# 응답 본문은 정상인데 X-RateLimit-* 헤더만 망가진 경우. Reset은 Remaining 0과 함께여야 적용 대상이 된다.
+MALFORMED_RATE_LIMIT_HEADERS = (
+    {"X-RateLimit-Remaining": "abc"},
+    {"X-RateLimit-Remaining": "-1"},
+    {"X-RateLimit-Remaining": "nan"},
+    {"X-RateLimit-Remaining": "inf"},
+    {"X-RateLimit-Limit": "0"},
+    {"X-RateLimit-Limit": "abc"},
+    {"X-RateLimit-Limit": "-4"},
+    {"X-RateLimit-Limit": "inf"},
+    {"X-RateLimit-Limit": "nan"},
+    # 1 미만의 양수 Limit은 토큰이 1에 닿지 못하거나 대기가 사실상 무한해진다.
+    {"X-RateLimit-Limit": "0.5"},
+    {"X-RateLimit-Limit": "0.001"},
+    {"X-RateLimit-Limit": "1e-6"},
+    {"X-RateLimit-Limit": "5e-324"},
+    {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "inf"},
+    {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1e9"},
+    {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "-5"},
+    {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "nan"},
+    {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "soon"},
+)
+
+
+def bucket_state(bucket):
+    return (bucket.rate, bucket.capacity, bucket.tokens, bucket.updated_at, bucket.blocked_until)
 
 
 class FakeClock:
@@ -124,6 +160,27 @@ class TokenProviderTests(IsolatedCase):
             self.assertIs(type(caught.exception), expected)
             self.assertEqual(caught.exception.code.value, "toss-ip-not-allowed" if expected is TossIpNotAllowed else "toss-auth-failed")
             self.assert_no_secrets(str(caught.exception))
+
+    def test_token_error_text_is_kept_only_when_it_is_an_oauth_code(self):
+        for status, body, shown in (
+            (401, {"error": "invalid_client"}, "invalid_client"),
+            (400, {"error": "unsupported_grant_type"}, "unsupported_grant_type"),
+            (400, {"error": f"{UNCONFIGURED_SECRET}\nX-Injected: yes"}, "unknown"),
+            (401, {"error": "invalid_client\n"}, "unknown"),
+            (401, {"error": "Invalid_Client"}, "unknown"),
+            (401, {"error": "invalid client"}, "unknown"),
+            (401, {"error": "a" * 41}, "unknown"),
+            (401, {"error": ""}, "unknown"),
+            (401, {"error": ["invalid_client"]}, "unknown"),
+            (500, ["invalid_client"], "unknown"),
+        ):
+            with self.subTest(status=status, body=body):
+                with self.assertRaises(TossAuthError) as caught:
+                    self.provider(lambda request, status=status, body=body: httpx.Response(status, json=body)).get_token()
+                message = str(caught.exception)
+                self.assertEqual(message, f"토스 토큰 발급 실패: HTTP {status}, code={shown}")
+                self.assertNotIn(UNCONFIGURED_SECRET, message)
+                self.assertNotIn("\n", message)
 
     def test_failed_issue_is_not_cached(self):
         answers = iter([httpx.Response(500, text="synthetic"), token_response("tok-a")])
@@ -280,6 +337,56 @@ class LiveClientTests(IsolatedCase):
         client.readonly.wait_for_slot(client.readonly.prepare_get(Operation.GET_RANKINGS, "/api/v1/rankings"))
         self.assertEqual(self.clock.sleeps, [2.0])
 
+    def test_malformed_rate_limit_headers_do_not_break_a_good_response(self):
+        payload = {"result": {"symbol": "000001"}}
+        for headers in MALFORMED_RATE_LIMIT_HEADERS:
+            with self.subTest(headers=headers):
+                client = self.client(lambda request, headers=headers: httpx.Response(200, json=payload, headers=headers))
+                self.assertEqual(self.get(client), payload)
+                bucket = client.readonly.rate_limiter.buckets[RateLimitGroup.MARKET_DATA]
+                self.assertTrue(all(math.isfinite(value) for value in bucket_state(bucket)), bucket_state(bucket))
+                self.assertEqual((bucket.rate, bucket.capacity), (10.0, 10.0))
+                self.assertLessEqual(bucket.blocked_until, self.clock.now() + RETRY_AFTER_CAP_SECONDS)
+                # 다음 요청도 유한한 시간만 기다리고 본문을 받는다.
+                self.assertEqual(self.get(client), payload)
+                self.assertTrue(all(0 <= seconds <= RETRY_AFTER_CAP_SECONDS for seconds in self.clock.sleeps), self.clock.sleeps)
+                self.assertEqual(self.sleeps, [])
+
+    def test_other_4xx_is_rejected_without_retry(self):
+        body = f"{REJECTION_BODY_MARKER} Bearer {ACCESS_TOKEN} {TOSS_SECRET}"
+        for status in REJECTED_STATUSES:
+            with self.subTest(status=status):
+                self.requests.clear()
+                client = self.client(lambda request, status=status: httpx.Response(status, text=body, headers={"Retry-After": "1"}))
+                with self.assertRaises(TossRequestRejected) as caught:
+                    self.get(client)
+                self.assertIsInstance(caught.exception, TossLiveError)
+                self.assertEqual(caught.exception.code.value, "toss-request-rejected")
+                self.assertEqual(str(caught.exception), f"토스 API가 요청을 거부했습니다: HTTP {status}")
+                self.assertEqual((len(self.api_requests()), len(self.token_requests()), self.sleeps), (1, 1, []))
+
+    def test_408_stays_a_request_failure_without_retry(self):
+        client = self.client(lambda request: httpx.Response(408, text=REJECTION_BODY_MARKER))
+        with self.assertRaises(TossLiveError) as caught:
+            self.get(client)
+        self.assertIs(type(caught.exception), TossLiveError)
+        self.assertEqual(caught.exception.code.value, "toss-request-failed")
+        self.assertNotIn(REJECTION_BODY_MARKER, str(caught.exception))
+        self.assertEqual((len(self.api_requests()), self.sleeps), (1, []))
+
+    def test_failure_messages_never_carry_the_response_body(self):
+        # envelope는 코드만 싣는다. 본문이 새는지는 여기서 예외 메시지로 확인한다(doctor가 str(exc)를 출력한다).
+        body = f"{REJECTION_BODY_MARKER} Bearer {ACCESS_TOKEN} id={TOSS_ID} secret={TOSS_SECRET} {UNCONFIGURED_SECRET}"
+        for status in (*REJECTED_STATUSES, 401, 403, 408, 429, 500, 503):
+            with self.subTest(status=status):
+                client = self.client(lambda request, status=status: httpx.Response(status, text=body))
+                with self.assertRaises((TossLiveError, TossAuthError)) as caught:
+                    self.get(client)
+                message = str(caught.exception)
+                for leaked in (REJECTION_BODY_MARKER, ACCESS_TOKEN, UNCONFIGURED_SECRET):
+                    self.assertNotIn(leaked, message)
+                self.assert_no_secrets(message)
+
 
 class RateLimiterTests(unittest.TestCase):
     def test_default_bucket_spacing(self):
@@ -309,6 +416,78 @@ class RateLimiterTests(unittest.TestCase):
         self.assertEqual((bucket.rate, bucket.capacity, bucket.tokens, bucket.blocked_until), (2.0, 2.0, 1.0, 0.0))
         limiter.update_from_headers(RateLimitGroup.STOCK, {"Content-Type": "application/json"})
         self.assertEqual(bucket.tokens, 1.0)
+
+    def test_unusable_headers_never_raise_and_leave_their_part_unchanged(self):
+        for headers in MALFORMED_RATE_LIMIT_HEADERS:
+            if "X-RateLimit-Reset" in headers:
+                continue
+            with self.subTest(headers=headers):
+                clock = FakeClock()
+                limiter = RateLimiter(clock=clock)
+                bucket = limiter.buckets[RateLimitGroup.STOCK]
+                before = bucket_state(bucket)
+                clock.value += 1.0  # Remaining이 적용되면 updated_at이 움직인다.
+                limiter.update_from_headers(RateLimitGroup.STOCK, headers)
+                self.assertEqual(bucket_state(bucket), before)
+        # Remaining 0은 적용되고, 쓸 수 없는 Reset만 무시된다. 1e9는 상한으로 잘린다.
+        for reset, blocked_until in (
+            ("inf", 0.0), ("-inf", 0.0), ("nan", 0.0), ("-5", 0.0), ("soon", 0.0), ("", 0.0),
+            ("1e9", 1001.0 + RETRY_AFTER_CAP_SECONDS), ("30.5", 1001.0 + RETRY_AFTER_CAP_SECONDS), ("0", 1001.0),
+        ):
+            with self.subTest(reset=reset):
+                clock = FakeClock()
+                limiter = RateLimiter(clock=clock)
+                clock.value += 1.0
+                limiter.update_from_headers(RateLimitGroup.STOCK, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": reset})
+                self.assertEqual(bucket_state(limiter.buckets[RateLimitGroup.STOCK]), (5.0, 5.0, 0.0, 1001.0, blocked_until))
+
+    def test_reset_is_capped_by_the_retry_after_cap(self):
+        self.assertEqual(RETRY_AFTER_CAP_SECONDS, 30.0)
+        self.assertEqual(retry_delay(0, retry_after="1e9"), RETRY_AFTER_CAP_SECONDS)
+        clock = FakeClock()
+        limiter = RateLimiter(clock=clock)
+        limiter.update_from_headers(RateLimitGroup.STOCK, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1e9"})
+        limiter.acquire(RateLimitGroup.STOCK)
+        self.assertEqual(clock.sleeps, [RETRY_AFTER_CAP_SECONDS])
+
+    def test_acquire_never_waits_longer_than_the_cap(self):
+        # 헤더 검증을 우회해 버킷을 직접 망가뜨려도 한 번의 대기는 상한을 넘지 않는다.
+        for rate in (1e-6, 5e-324):
+            with self.subTest(rate=rate):
+                clock = FakeClock()
+                limiter = RateLimiter(clock=clock)
+                bucket = limiter.buckets[RateLimitGroup.STOCK]
+                bucket.rate, bucket.tokens = rate, 0.0
+                limiter.acquire(RateLimitGroup.STOCK)
+                self.assertEqual(clock.sleeps, [RETRY_AFTER_CAP_SECONDS])
+        clock = FakeClock()
+        limiter = RateLimiter(clock=clock)
+        limiter.buckets[RateLimitGroup.STOCK].blocked_until = clock.now() + 1e9
+        limiter.acquire(RateLimitGroup.STOCK)
+        self.assertEqual(clock.sleeps, [RETRY_AFTER_CAP_SECONDS])
+
+    def test_limit_must_be_at_least_one(self):
+        for limit, expected_rate in (("0.999", 5.0), ("1", 1.0), ("1.5", 1.5), ("1e9", 1e9)):
+            with self.subTest(limit=limit):
+                clock = FakeClock()
+                limiter = RateLimiter(clock=clock)
+                limiter.update_from_headers(RateLimitGroup.STOCK, {"X-RateLimit-Limit": limit})
+                bucket = limiter.buckets[RateLimitGroup.STOCK]
+                self.assertEqual((bucket.rate, bucket.capacity), (expected_rate, expected_rate))
+                self.assertEqual(bucket.tokens, min(5.0, expected_rate))
+
+    def test_valid_headers_still_apply_next_to_unusable_ones(self):
+        clock = FakeClock()
+        limiter = RateLimiter(clock=clock)
+        bucket = limiter.buckets[RateLimitGroup.STOCK]
+        limiter.update_from_headers(RateLimitGroup.STOCK, {"X-RateLimit-Limit": "abc", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "2"})
+        self.assertEqual(bucket_state(bucket), (5.0, 5.0, 0.0, 1000.0, 1002.0))
+        clock.value = 1010.0
+        limiter.update_from_headers(RateLimitGroup.STOCK, {"X-RateLimit-Limit": "4", "X-RateLimit-Remaining": "nan", "X-RateLimit-Reset": "inf"})
+        self.assertEqual(bucket_state(bucket), (4.0, 4.0, 0.0, 1000.0, 1002.0))
+        limiter.acquire(RateLimitGroup.STOCK)
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(bucket_state(bucket), (4.0, 4.0, 3.0, 1010.0, 0.0))
 
     def test_retry_delay(self):
         for attempt, retry_after, expected in (
@@ -522,19 +701,82 @@ class SecretBoundaryTests(IsolatedCase):
                 self.assert_no_secrets(repr(result))
                 self.assertNotIn(ACCESS_TOKEN, repr(result))
 
-    def test_doctor_masks_a_secret_echoed_by_the_token_endpoint(self):
+    def test_malformed_rate_limit_headers_still_return_the_payload(self):
+        payload = {"result": {"symbol": "000001", "levels": []}}
+        for headers in MALFORMED_RATE_LIMIT_HEADERS:
+            with self.subTest(headers=headers):
+                runtime = self.runtime(lambda request, headers=headers: httpx.Response(200, json=payload, headers=headers))
+                result = self.call(runtime, "get_orderbook", {"symbol": "000001"})
+                self.assertEqual(result["data"], payload["result"])
+
+    def test_http_statuses_map_to_envelope_codes(self):
+        body = f"{REJECTION_BODY_MARKER} Bearer {ACCESS_TOKEN} id={TOSS_ID} secret={TOSS_SECRET}"
+        rejected = ("blocked", "toss-request-rejected")
+        cases = (
+            (400, rejected, 1), (404, rejected, 1), (409, rejected, 1), (422, rejected, 1),
+            (408, ("unavailable", "toss-request-failed"), 1),
+            (401, ("unavailable", "toss-auth-failed"), 2),
+            (403, ("unavailable", "toss-ip-not-allowed"), 1),
+            (429, ("unavailable", "toss-rate-limited"), 3),
+            (500, ("unavailable", "toss-request-failed"), 3),
+            (503, ("unavailable", "toss-request-failed"), 3),
+        )
+        for status, (envelope_status, code), attempts in cases:
+            with self.subTest(status=status):
+                self.requests.clear()
+                runtime = self.runtime(lambda request, status=status: httpx.Response(status, text=body))
+                result = self.call(runtime, "get_orderbook", {"symbol": "000001"})
+                self.assertEqual(result["data"], {"status": envelope_status, "error": code})
+                self.assertEqual(len([request for request in self.requests if request.url.path != "/oauth2/token"]), attempts)
+                # envelope 모양 점검: envelope는 상태와 코드만 싣고 예외 메시지를 담지 않는다.
+                # 본문 유출 자체는 LiveClientTests.test_failure_messages_never_carry_the_response_body가 str(exc)로 본다.
+                rendered = repr(result) + json.dumps(result, ensure_ascii=False)
+                self.assertNotIn(REJECTION_BODY_MARKER, rendered)
+                self.assert_no_secrets(rendered)
+                self.assertNotIn(ACCESS_TOKEN, rendered)
+
+    def doctor_output(self, token_status, token_body):
         def handler(request):
             if request.url.path == "/api/company.json":
                 return httpx.Response(200, json={"status": "000", "corp_code": request.url.params["corp_code"], "corp_name": "가상회사"})
-            return httpx.Response(401, json={"error": f"bad secret {TOSS_SECRET} for {TOSS_ID}"})
+            return httpx.Response(token_status, json=token_body)
 
         output = io.StringIO()
         code = doctor(environ={"DART_API_KEY": DART_KEY, "TOSS_CLIENT_ID": TOSS_ID, "TOSS_CLIENT_SECRET": TOSS_SECRET},
                       user_env_file=self.root / "absent.env", output=output, http_client=self.mock_client(handler),
                       state_dir=self.root / "state")
         self.assertEqual(code, 1)
-        self.assertIn(MASK, output.getvalue())
         self.assert_no_secrets(output.getvalue())
+        return output.getvalue()
+
+    def test_doctor_never_prints_the_token_endpoint_error_text(self):
+        # 설정된 비밀이 섞인 error는 이제 마스킹 전에 통째로 버려진다(예전에는 MASK로 가려 출력했다).
+        output = self.doctor_output(401, {"error": f"bad secret {TOSS_SECRET} for {TOSS_ID}"})
+        self.assertIn("FAIL    : 토스 인증 점검: 토스 토큰 발급 실패: HTTP 401, code=unknown\n", output)
+        self.assertNotIn(MASK, output)
+        # 설정값이 아닌 가짜 비밀과 줄바꿈은 마스킹 대상이 아니므로 출력 전에 버려져야 한다.
+        output = self.doctor_output(400, {"error": f"{UNCONFIGURED_SECRET}\nPASS    : 위조된 줄"})
+        self.assertIn("FAIL    : 토스 인증 점검: 토스 토큰 발급 실패: HTTP 400, code=unknown\n", output)
+        self.assertNotIn(UNCONFIGURED_SECRET, output)
+        self.assertNotIn("위조된 줄", output)
+        # 정상적인 OAuth2 오류 코드는 그대로 보인다.
+        output = self.doctor_output(401, {"error": "invalid_client"})
+        self.assertIn("FAIL    : 토스 인증 점검: 토스 토큰 발급 실패: HTTP 401, code=invalid_client\n", output)
+
+    def test_doctor_masks_configured_secrets_in_failure_text(self):
+        # auth.py가 서버 error 문자열을 버리므로, 설정된 비밀이 든 예외를 직접 만들어 doctor의 마스킹을 확인한다.
+        output = io.StringIO()
+        with patch.object(DartReadonlyClient, "get_company", side_effect=DartLiveError(f"x {DART_KEY}")), \
+                patch.object(TossTokenProvider, "get_token", side_effect=TossAuthError(f"synthetic {TOSS_SECRET} {TOSS_ID}")):
+            code = doctor(environ={"DART_API_KEY": DART_KEY, "TOSS_CLIENT_ID": TOSS_ID, "TOSS_CLIENT_SECRET": TOSS_SECRET},
+                          user_env_file=self.root / "absent.env", output=output, http_client=self.mock_client(),
+                          state_dir=self.root / "state")
+        self.assertEqual(code, 1)
+        text = output.getvalue()
+        self.assertIn(f"FAIL    : DART 인증 및 회사개황 점검: x {MASK}\n", text)
+        self.assertIn(f"FAIL    : 토스 인증 점검: synthetic {MASK} {MASK}\n", text)
+        self.assert_no_secrets(text)
+        self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":

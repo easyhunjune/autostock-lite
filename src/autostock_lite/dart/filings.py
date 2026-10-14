@@ -123,6 +123,12 @@ class FilingDiff:
 _CORRECTION = re.compile(r"(?:\[?\s*(?:정정|첨부정정|기재정정)\s*\]?|\(\s*정정\s*\))", re.I)
 _SPACE = re.compile(r"\s+")
 _TAG = re.compile(r"<[^>]+>")
+_TAG_NAME = re.compile(r"<\s*/?\s*([A-Za-z][\w:.-]*)")
+# 문장 안에 놓이는 인라인 태그(대소문자 무시). 빈 문자열로 지워 "반도체</SPAN>를"이 "반도체를"로 붙는다.
+# DART의 USERMARK 강조는 SPAN 속성이다. 이 목록 밖의 태그는 모두 줄바꿈이 된다.
+_INLINE_TAGS = frozenset({"a", "b", "em", "font", "i", "span", "strong", "sub", "sup", "u"})
+# str.splitlines가 줄 경계로 보는 문자 전부. 마크업에서는 줄 경계가 아니라 공백이다.
+_LINE_BREAKS = re.compile(r"[\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]+")
 _COMMENT = re.compile(r"<!--.*?-->", re.S)
 _TAG_NAME_END = r"(?![\w:.-])"
 _TABLE_FAMILY = r"(?:table|tr|td|th|te|tu)"
@@ -147,11 +153,21 @@ _RESIDUAL_TABLE = re.compile(
 )
 _TABLE_SENTINEL = re.compile("\ue000([0-9]+)\ue001")
 _XML_ENCODING = re.compile(br"<\?xml[^>]*encoding=[\"']([^\"']+)[\"']", re.I)
-_SENTENCE = re.compile(r"(?<=[.!?。])\s+|\n+")
+# 줄바꿈 경계는 normalize_sentences가 줄 단위로 먼저 나눠 처리한다. 이 식은 한 줄 안만 나눈다.
+_SENTENCE = re.compile(r"(?<=[.!?。])\s+")
+_HORIZONTAL_SPACE = re.compile(r"[^\S\n]+")
+_NOTE_MARKER = re.compile(r"(?:주석|각주)[^\S\n]*\d+\)?")
+# 줄 맨 앞 목록 표식(1. / 1.2. / 가. / II.)의 마침표는 문장 끝이 아니다. NFKC 뒤에 적용하므로
+# Ⅰ·Ⅱ는 I·II로, ①은 1로 바뀌어 들어온다. (1)·①처럼 마침표가 없는 표식은 애초에 나뉘지 않는다.
+_LIST_MARKER = re.compile(r"(?:[IVXLC]{1,8}|\d+(?:\.\d+)*|[가나다라마바사아자차카타파하])\.[^\S\n]+")
+# fullmatch로 쓴다. _heading_identity가 줄을 strip하므로 끝 공백은 매치하지 않는다(긴 공백에서 되돌아가지 않게).
+# 로마 숫자·한글 순번 표식은 공백 없이 한글 음절이 바로 와도 된다(인라인 태그가 지워져 "II.사업의 내용"처럼 붙는다).
+# 그 밖의 문자("C.E.O.", "X.(주)", "IV.-")가 붙으면 표식이 아니다. 제N장/편은 공백이나 마침표+한글이 있어야 한다
+# ("제2장에서 설명한" 같은 참조가 1레벨 제목이 되지 않게). 숫자 표식 뒤에는 공백이 꼭 있어야 한다("3.5% 늘었다").
 _PREFIXED_HEADING = re.compile(
-    r"^\s*(?:(?P<roman>[IVXLC]{1,8})\.|(?P<number>\d+(?:\.\d+)*)\.?|"
-    r"(?P<korean>[가나다라마바사아자차카타파하])\.|"
-    r"제\s*(?P<chapter>\d+)\s*(?:장|편)\.?)\s+(?P<title>\S.*?)\s*$"
+    r"^\s*(?:(?:(?P<roman>[IVXLC]{1,8})\.|(?P<korean>[가나다라마바사아자차카타파하])\.)(?:\s+|(?=[가-힣]))|"
+    r"제\s*(?P<chapter>\d+)\s*(?:장|편)(?:\.?\s+|\.(?=[가-힣]))|"
+    r"(?P<number>\d+(?:\.\d+)*)\.?\s+)(?P<title>\S.*)"
 )
 _LIST_DATE = re.compile(r"(?:\d{8}|\d{4}-\d{2}-\d{2})")
 
@@ -317,8 +333,45 @@ def _render_table(match: re.Match[str], tables: list[list[list[str]]]) -> str:
     return f"\n\ue000{len(tables) - 1}\ue001\n"
 
 
-def _to_text(markup: str) -> str:
+def _tag_break(match: re.Match[str]) -> str:
+    name = _TAG_NAME.match(match.group(0))
+    return "" if name is not None and name.group(1).lower() in _INLINE_TAGS else "\n"
+
+
+def _text_run(run: str) -> str:
+    """태그 사이 텍스트의 엔티티를 풀고, 풀어서 생긴 줄바꿈 문자는 공백으로 바꾼다.
+
+    &#10; &#xD; &#12; &#8232; &NewLine; 등 표기·대소문자·0 채움과 상관없이 결과 문자로 판단한다.
+    원문 줄바꿈은 _to_text 첫머리에서 이미 공백이 됐으므로 여기 남은 LF는 표 처리(빈 표, 남은 표 태그)가
+    넣은 줄 경계다. 그 LF는 남긴다.
+    """
+    return "\n".join(_LINE_BREAKS.sub(" ", unescape(part)) for part in run.split("\n"))
+
+
+def _markup_lines(piece: str) -> str:
+    """표 밖 마크업 조각을 텍스트로 바꾼다. 인라인 태그는 지우고 나머지 태그는 줄바꿈으로 바꾼다."""
+    parts: list[str] = []
+    last = 0
+    for match in _TAG.finditer(piece):
+        parts.append(_text_run(piece[last:match.start()]))
+        parts.append(_tag_break(match))
+        last = match.end()
+    parts.append(_text_run(piece[last:]))
+    return "".join(parts)
+
+
+def _to_text(markup: str, *, plain_text: bool = False) -> str:
+    """원문을 줄 단위 텍스트로 바꾼다. 마크업에서 줄바꿈은 블록 태그에서만 나온다.
+
+    마크업 원문의 줄바꿈 문자는 공백 하나가 된다. 표 셀은 원래 공백을 접으므로
+    표 렌더링 결과는 같다. .txt 원문(plain_text)은 마크업이 아니므로 태그·표·엔티티 처리 없이
+    str.splitlines 기준으로 줄을 나누고, 줄마다 공백을 접어 빈 줄을 버린다.
+    """
+    if plain_text:
+        lines = (_HORIZONTAL_SPACE.sub(" ", line).strip() for line in markup.splitlines())
+        return "\n".join(line for line in lines if line)
     markup = re.sub(r"&cr;", " ", markup, flags=re.I)
+    markup = _LINE_BREAKS.sub(" ", markup)
     text = _COMMENT.sub(" ", markup.replace("\ue000", "&#xE000;").replace("\ue001", "&#xE001;"))
     tables: list[list[list[str]]] = []
     for _ in range(_MAX_TABLE_PASSES):
@@ -334,10 +387,11 @@ def _to_text(markup: str) -> str:
     pieces = _TABLE_SENTINEL.split(text)
     text = "".join(
         "\n" + "\n".join("| " + " | ".join(row) + " |" for row in tables[int(piece)]) + "\n" if index % 2
-        else re.sub(r"[ \t\f\v]+", " ", unescape(_TAG.sub("\n", piece)))
+        else re.sub(r"[ \t\f\v]+", " ", _markup_lines(piece))
         for index, piece in enumerate(pieces)
     )
-    return re.sub(r"\n[ \t]*\n+", "\n", text).strip()
+    # 줄 끝 공백과 빈 줄(공백만 있는 줄 포함)을 접는다.
+    return re.sub(r"[ \t]*\n[ \t\n]*", "\n", text).strip()
 
 
 def _validate_resolved_filing(filing: Filing) -> None:
@@ -360,7 +414,7 @@ def get_filing_document(reader: FilingReader, *, filing: Filing) -> FilingDocume
             if not name.lower().endswith((".xml", ".html", ".htm", ".txt")):
                 continue
             content, encoding = _decode(archive.read(name))
-            parts.append(_to_text(content))
+            parts.append(_to_text(content, plain_text=name.lower().endswith(".txt")))
             encodings.append(encoding)
     finally:
         archive.close()
@@ -385,12 +439,31 @@ def _is_table_row(line: str) -> bool:
     return len(line) >= 3 and line.startswith("| ") and line.endswith(" |")
 
 
+def _lines(text: str) -> list[str]:
+    """텍스트를 줄로 나눈다. 줄 경계는 LF, CRLF, CR이다.
+
+    get_filing_section과 normalize_sentences가 함께 써서 절 본문과 문장이 같은 줄을 본다.
+    _to_text는 CR을 내보내지 않으므로 CR 경계는 밖에서 만든 FilingDocument 텍스트에만 해당한다.
+    """
+    return re.split(r"\r\n?|\n", text)
+
+
 def normalize_sentences(text: str) -> tuple[str, ...]:
-    text = "\n".join(line for line in text.splitlines() if not _is_table_row(line))
+    """표 행을 뺀 산문을 문장으로 나눈다. 줄바꿈과 문장 끝 부호 뒤 공백이 경계다."""
+    text = "\n".join(line for line in _lines(text) if not _is_table_row(line))
     text = normalize("NFKC", text)
-    text = re.sub(r"(?:주석|각주)\s*\d+\)?", " ", text)
-    text = _SPACE.sub(" ", text).strip()
-    return tuple(sentence.strip() for sentence in _SENTENCE.split(text) if sentence.strip())
+    text = _NOTE_MARKER.sub(" ", text)
+    sentences: list[str] = []
+    for line in text.split("\n"):
+        line = _HORIZONTAL_SPACE.sub(" ", line).strip()
+        if not line:
+            continue
+        marker = _LIST_MARKER.match(line)
+        start = marker.end() if marker is not None else 0
+        pieces = _SENTENCE.split(line[start:])
+        pieces[0] = line[:start] + pieces[0]
+        sentences.extend(piece.strip() for piece in pieces if piece.strip())
+    return tuple(sentences)
 
 
 def _allowed_sections(doc_type: str) -> tuple[str, ...]:
@@ -424,7 +497,7 @@ def get_filing_section(document: FilingDocument, *, section: str) -> FilingSecti
     """
     if section not in _allowed_sections(document.doc_type):
         return FilingSection(document.rcept_no, document.doc_type, section, "section-not-applicable")
-    lines = [line.strip() for line in re.split(r"[\r\n]+", document.text) if line.strip()]
+    lines = [line.strip() for line in _lines(document.text) if line.strip()]
     start: int | None = None
     section_level = 1
     for index, line in enumerate(lines):

@@ -29,6 +29,12 @@ class TossRateLimited(TossLiveError):
     code = ErrorCode.TOSS_RATE_LIMITED
 
 
+class TossRequestRejected(TossLiveError):
+    """401·403·408·429를 뺀 HTTP 4xx. 같은 요청은 재시도해도 같은 답을 받는다."""
+
+    code = ErrorCode.TOSS_REQUEST_REJECTED
+
+
 class TossLiveClient:
     def __init__(
         self,
@@ -91,6 +97,11 @@ class TossLiveClient:
                     continue
             if response.status_code == 429:
                 raise TossRateLimited("토스 API 요청 한도를 초과했습니다: HTTP 429")
+            if 400 <= response.status_code < 500 and response.status_code != 408:
+                # 응답 본문은 메시지에 싣지 않는다. 상태 코드만 남긴다.
+                raise TossRequestRejected(
+                    f"토스 API가 요청을 거부했습니다: HTTP {response.status_code}"
+                )
             if response.status_code != 200:
                 raise TossLiveError(f"토스 API 응답 실패: HTTP {response.status_code}")
             try:

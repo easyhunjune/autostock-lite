@@ -36,6 +36,7 @@ class ErrorCode(str, Enum):
     TOSS_RATE_LIMITED = "toss-rate-limited"
     TOSS_RESPONSE_INVALID = "toss-response-invalid"
     TOSS_REQUEST_FAILED = "toss-request-failed"
+    TOSS_REQUEST_REJECTED = "toss-request-rejected"  # 401·403·408·429를 뺀 HTTP 4xx, 재시도 안 함
 
     # Disclosed financial statements (get_financial_statements).
     FINANCIALS_NO_DATA = "financials-no-data"
