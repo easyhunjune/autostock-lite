@@ -19,8 +19,10 @@ from .client import (
     DartResponseError,
 )
 from .corp_code import (
+    CorpCodeDownloadError,
     CorpCodeError,
     CorpCodeIndex,
+    CorpCodeIndexError,
     CorpCodeRecord,
     CorpCodeRefreshResult,
     CorpCodeRefreshService,
@@ -69,8 +71,10 @@ __all__ = [
     "DartReadonlyClient",
     "DartRequestRejected",
     "DartResponseError",
+    "CorpCodeDownloadError",
     "CorpCodeError",
     "CorpCodeIndex",
+    "CorpCodeIndexError",
     "CorpCodeRecord",
     "CorpCodeRefreshResult",
     "CorpCodeRefreshService",

@@ -32,6 +32,12 @@ class CorpCodeDownloadError(CorpCodeError):
     code = ErrorCode.DART_REQUEST_FAILED
 
 
+class CorpCodeIndexError(CorpCodeError):
+    """The local index metadata is unreadable; this is server state, not DART data."""
+
+    code = ErrorCode.INTERNAL_ERROR
+
+
 @dataclass(frozen=True)
 class CorpCodeRecord:
     corp_code: str
@@ -205,8 +211,11 @@ class CorpCodeRefreshService:
             raise CorpCodeDownloadError("could not download corpCode archive") from exc
         if response.status_code != 200:
             raise CorpCodeDownloadError(f"corpCode download failed: HTTP {response.status_code}")
-        if not response.content.startswith(b"PK"):
-            # DART answers a bad key or rate limit with a short status body instead of a ZIP.
+        if isinstance(response.content, bytes) and not response.content.startswith(b"PK"):
+            # DART answers a bad key, rate limit, maintenance or missing file (014)
+            # with a short status body instead of a ZIP; surface that status's own
+            # code.  An unrecognizable body falls through to the archive checks,
+            # which reject it as dart-response-invalid.
             raise_for_status_body(response.content)
         # Parse before opening the write transaction, preserving the old snapshot
         # for malformed data, HTTP proxies, and all archive-validation failures.
@@ -221,7 +230,7 @@ class CorpCodeRefreshService:
         try:
             return self._as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
         except ValueError as exc:
-            raise CorpCodeError("corpCode index has an invalid refreshed_at value") from exc
+            raise CorpCodeIndexError("corpCode index has an invalid refreshed_at value") from exc
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:

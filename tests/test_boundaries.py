@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+from datetime import date
 import importlib
 import inspect
 import logging
@@ -14,17 +15,21 @@ import httpx
 
 import autostock_research
 from autostock_research import cli
-from autostock_research.calc.growth import growth_metrics
+from autostock_research.calc.growth import GROWTH_FORMULA_VERSION, growth_metrics
 from autostock_research.dart.client import (
     DartAuthError, DartLiveError, DartMaintenance, DartNoData, DartRateLimited,
-    DartRequestRejected, DartResponseError,
+    DartReadonlyClient, DartRequestRejected, DartResponseError, raise_for_dart_status,
+)
+from autostock_research.dart.corp_code import (
+    CorpCodeDownloadError, CorpCodeError, CorpCodeIndexError, CorpCodeRecord,
 )
 from autostock_research.dart.filings import (
     FilingArchiveError, FilingArgumentError, FilingEncodingError, FilingError,
     FilingSchemaError, FilingSection,
 )
 from autostock_research.dart.ownership import OwnershipError, OwnershipSchemaError
-from autostock_research.mcp_server import ToolArgumentsError, ToolService
+from autostock_research.mcp_runtime import FilingContextError
+from autostock_research.mcp_server import TOOL_REGISTRY, ToolArgumentsError, ToolService
 from autostock_research.provenance import MASK
 from autostock_research.status_codes import (
     ERROR_CODES, UNAVAILABLE_CODES, ErrorCode, InvalidArgumentError,
@@ -85,15 +90,23 @@ class RedactionRoundTripTests(unittest.TestCase):
         self.assertNotIn(DART_KEY, repr(result))
 
     def test_secret_query_params_and_authorization_tokens_only(self):
+        # The header token is token-shaped (17 chars, letters and digits); a shorter
+        # plain value is deliberately left alone (see RedactionTighteningTests).
         text = (
-            "요청 https://opendart.example.test/api/list.json?corp_code=99000001&crtfc_key=unconfigured0001&page_no=1\n"
-            "헤더 Authorization: Bearer abc.DEF-123_456\n"
-            "The bearer bond stays readable."
+            "요청 https://opendart.example.test/api/list.json?corp_code=99000001&crtfc_key=unconfigured0001&page_no=1#p\n"
+            "다른 표기 http://h.example.test/cb?Client-Secret=abc123&state=x+y\r\n"
+            "헤더 Authorization: Bearer abc.DEF-123_456==\n"
+            '{"authorization": "Bearer eyJzeW50aGV0aWMiOjF9.eyJ0ZXN0IjoiMjA5OSJ9.c3ludGhldGlj"}\n'
+            "The bearer bond stays readable. Bearer 100 units.\n"
+            "| crtfc_key | unconfigured0001 |"
         )
         expected = (
-            f"요청 https://opendart.example.test/api/list.json?corp_code=99000001&crtfc_key={MASK}&page_no=1\n"
+            f"요청 https://opendart.example.test/api/list.json?corp_code=99000001&crtfc_key={MASK}&page_no=1#p\n"
+            f"다른 표기 http://h.example.test/cb?Client-Secret={MASK}&state=x+y\r\n"
             f"헤더 Authorization: Bearer {MASK}\n"
-            "The bearer bond stays readable."
+            f'{{"authorization": "Bearer {MASK}"}}\n'
+            "The bearer bond stays readable. Bearer 100 units.\n"
+            "| crtfc_key | unconfigured0001 |"
         )
         result = call(self.service(section(text)), "get_filing_section", self.arguments)
         self.assertEqual(result["data"]["text"], expected)
@@ -102,6 +115,86 @@ class RedactionRoundTripTests(unittest.TestCase):
         payload = {"crtfc_key": "unconfigured0001", "Client-Secret": "x", "corp_code": CORP}
         result = call(self.service(payload), "get_filing_section", self.arguments)
         self.assertEqual(result["data"], {"crtfc_key": MASK, "Client-Secret": MASK, "corp_code": CORP})
+
+
+class RedactionTighteningTests(unittest.TestCase):
+    """Only the secret bytes change; prose, glued text and quotes stay put."""
+
+    def redact(self, text):
+        payload = FilingSection(RCEPT, "annual_report", "사업의 내용", "ok", text, (text,))
+        service = ToolService({"get_filing_section": lambda **_: payload}, secret_values=(DART_KEY,))
+        result = call(service, "get_filing_section", {"rcept_no": RCEPT, "section": "사업의 내용"})
+        self.assertEqual(result["data"]["sentences"], [result["data"]["text"]])
+        return result["data"]["text"]
+
+    def test_bearer_prose_is_byte_identical(self):
+        for prose in (
+            "Board authorization: bearer bonds were issued",
+            "Board authorization: bearer bonds.",
+            "Authorization: Bearer of the note",
+            "Bearer 100 units. The bearer clause applies.",
+            "이사회 authorization: bearer 채권 발행",
+            "The bearer 3.5% notes",
+            "to bearer e.g. on demand",
+            "the bearer U.S. persons",
+            "a bearer non-interest-bearing-instrument",
+            "a bearer non-interest-bearing-2099-instrument",
+            "the bearer instruments.Furthermore",
+            "Authorization: bearer of record 2099.",
+            "무기명식(bearer) 사채 100% 상환\t| 구분 | bearer |\n다음 줄",
+        ):
+            with self.subTest(prose=prose):
+                self.assertEqual(self.redact(prose).encode("utf-8"), prose.encode("utf-8"))
+
+    def test_query_value_stops_at_key_shaped_characters(self):
+        self.assertEqual(self.redact("https://x.example.test/?crtfc_key=K에서 오류"),
+                         f"https://x.example.test/?crtfc_key={MASK}에서 오류")
+        self.assertEqual(self.redact('링크 "https://x.example.test/?crtfc_key=abc123" 끝'),
+                         f'링크 "https://x.example.test/?crtfc_key={MASK}" 끝')
+        self.assertEqual(self.redact("(see https://x.example.test/a?b=1&client_secret=s3cr%2Bt).\n다음"),
+                         f"(see https://x.example.test/a?b=1&client_secret={MASK}).\n다음")
+        self.assertEqual(self.redact("요청 https://x.example.test/?crtfc_key=abc123."),
+                         f"요청 https://x.example.test/?crtfc_key={MASK}.")
+        self.assertEqual(self.redact("https://x.example.test/p;dart-api-key=abc123?x=1"),
+                         f"https://x.example.test/p;dart-api-key={MASK}?x=1")
+        # Outside an http(s) URL a "crtfc_key=" pair is ordinary text.
+        self.assertEqual(self.redact("설정 예: ?crtfc_key=abc123 형식"), "설정 예: ?crtfc_key=abc123 형식")
+
+    def test_token_shaped_bearer_values_are_masked_with_or_without_authorization(self):
+        long_token = "abcdefghijklmnopqrstuvwxyz0123456789"
+        jwt = "eyJzeW50aGV0aWMiOjF9.eyJ0ZXN0IjoiMjA5OSJ9.c3ludGhldGlj"
+        base64_token = "c3ludGhldGljIHRva2VuIDIwOTk5OQ=="
+        self.assertEqual(self.redact(f"call with Bearer {long_token} then"), f"call with Bearer {MASK} then")
+        self.assertEqual(self.redact(f"bearer {jwt}"), f"bearer {MASK}")
+        self.assertEqual(self.redact(f"Bearer {base64_token}"), f"Bearer {MASK}")
+        self.assertEqual(self.redact(f"Authorization: Bearer {base64_token}"), f"Authorization: Bearer {MASK}")
+        self.assertEqual(self.redact(f"Authorization: Bearer {jwt}."), f"Authorization: Bearer {MASK}.")
+        self.assertEqual(self.redact("Bearer 0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"), f"Bearer {MASK}")
+        # The header form is a little looser (16+ chars) than a bare "Bearer" (24+).
+        self.assertEqual(self.redact("Authorization: Bearer abcd1234efgh5678"), f"Authorization: Bearer {MASK}")
+        self.assertEqual(self.redact("Bearer abcd1234efgh5678"), "Bearer abcd1234efgh5678")
+
+    def test_short_authorization_bearer_value_is_a_known_gap(self):
+        """A short, plain value cannot be told from prose and stays readable.
+
+        This is deliberate (same as the upstream project).  Configured secrets are
+        still replaced whatever their shape, so the gap only covers tokens the
+        server was never configured with.
+        """
+
+        self.assertEqual(self.redact("Authorization: Bearer abc123"), "Authorization: Bearer abc123")
+        self.assertEqual(self.redact(f"Authorization: Bearer {DART_KEY}"), f"Authorization: Bearer {MASK}")
+
+    def test_configured_secret_is_replaced_before_patterns(self):
+        secret = "tossSecret!xyz*9"
+        payload = FilingSection(RCEPT, "annual_report", "사업의 내용", "ok",
+                                f"https://x.example.test/?client_secret={secret}&a=1", ())
+        service = ToolService({"get_filing_section": lambda **_: payload}, secret_values=(secret,))
+        result = call(service, "get_filing_section", {"rcept_no": RCEPT, "section": "사업의 내용"})
+        self.assertEqual(result["data"]["text"], f"https://x.example.test/?client_secret={MASK}&a=1")
+        rendered = repr(result)
+        self.assertNotIn("xyz*9", rendered)
+        self.assertNotIn("!xyz", rendered)
 
 
 def _iter_modules():
@@ -136,6 +229,18 @@ class ErrorCodeRegistryTests(unittest.TestCase):
                     else:
                         self.fail(f"{where}: code must be a string or ErrorCode member")
         self.assertGreaterEqual(len(found), 25)
+        names = {where.replace("\\", "/") for where, _ in found}
+        # Guard the scan itself: these must be among the classes it sees.
+        for expected in (
+            "dart/client.py:DartNoData",
+            "dart/filings.py:FilingArgumentError",
+            "dart/ownership.py:OwnershipError",
+            "dart/corp_code.py:CorpCodeError",
+            "dart/corp_code.py:CorpCodeIndexError",
+            "dart/statements.py:StatementsNoData",
+            "mcp_runtime.py:FilingContextError",
+        ):
+            self.assertIn(expected, names)
         for where, code in found:
             with self.subTest(where=where):
                 self.assertIn(code, ERROR_CODES)
@@ -161,6 +266,7 @@ class ErrorCodeRegistryTests(unittest.TestCase):
             FilingArchiveError: ("blocked", "filing-archive-invalid"),
             FilingEncodingError: ("blocked", "filing-encoding-invalid"),
             FilingArgumentError: ("blocked", "invalid-argument"),
+            FilingContextError: ("blocked", "filing-context-unavailable"),
             InvalidArgumentError: ("blocked", "invalid-argument"),
             OwnershipError: ("blocked", "ownership-error"),
             OwnershipSchemaError: ("blocked", "ownership-schema-invalid"),
@@ -171,6 +277,9 @@ class ErrorCodeRegistryTests(unittest.TestCase):
             DartRateLimited: ("unavailable", "dart-rate-limited"),
             DartMaintenance: ("unavailable", "dart-maintenance"),
             DartLiveError: ("unavailable", "dart-request-failed"),
+            CorpCodeError: ("blocked", "dart-response-invalid"),
+            CorpCodeDownloadError: ("unavailable", "dart-request-failed"),
+            CorpCodeIndexError: ("unavailable", "internal-error"),
             StrictModelError: ("blocked", "toss-response-invalid"),
             TossAuthError: ("unavailable", "toss-auth-failed"),
             TossIpNotAllowed: ("unavailable", "toss-ip-not-allowed"),
@@ -221,14 +330,40 @@ class DartAdapterCodeTests(IsolatedCase):
         for status, expected in (
             ("010", ("unavailable", "dart-auth-failed")), ("011", ("unavailable", "dart-auth-failed")),
             ("012", ("unavailable", "dart-auth-failed")), ("901", ("unavailable", "dart-auth-failed")),
-            ("020", ("unavailable", "dart-rate-limited")), ("100", ("blocked", "dart-request-invalid")),
+            ("013", ("blocked", "dart-no-data")),
+            # 014 is a file-endpoint status; on a JSON endpoint it is a contract break, not "no data".
+            ("014", ("blocked", "dart-response-invalid")),
+            ("020", ("unavailable", "dart-rate-limited")), ("021", ("blocked", "dart-request-invalid")),
+            ("100", ("blocked", "dart-request-invalid")),
             ("101", ("blocked", "dart-request-invalid")), ("800", ("unavailable", "dart-maintenance")),
             ("900", ("unavailable", "dart-request-failed")),
         ):
             with self.subTest(status=status):
-                result = call(self.live(self.status(status)).service, "get_company_profile", {"corp_code": CORP})
-                self.assertEqual(result["data"], {"status": expected[0], "error": expected[1]})
-                self.assert_no_secrets(repr(result))
+                for name, arguments in (
+                    ("get_company_profile", {"corp_code": CORP}),
+                    ("get_major_shareholders", {"corp_code": CORP, "year": "2025"}),
+                ):
+                    result = call(self.live(self.status(status)).service, name, arguments)
+                    self.assertEqual(result["data"], {"status": expected[0], "error": expected[1]}, name)
+                    self.assert_no_secrets(repr(result))
+
+    def test_json_014_is_never_read_as_no_data(self):
+        runtime = self.live(self.status("014"))
+        result = call(runtime.service, "list_filings", {"corp_code": CORP, "from": "2025-01-01", "to": "2025-12-31"})
+        self.assertEqual(result["data"], {"status": "blocked", "error": "dart-response-invalid"})
+        result = call(runtime.service, "get_financial_statements", {"corp_code": CORP, "bsns_year": "2025"})
+        self.assertEqual(result["data"], {"status": "blocked", "error": "dart-response-invalid"})
+        client = DartReadonlyClient(DART_KEY, http_client=self.mock_client(self.status("014")))
+        with self.assertRaises(DartResponseError) as caught:
+            client.list_disclosures(CORP, begin_date=date(2025, 1, 1), end_date=date(2025, 12, 31))
+        self.assertEqual(caught.exception.status, "014")
+        self.assertNotIsInstance(caught.exception, DartNoData)
+        # 013 on page one is still the ordinary "no filings" / "no statements" answer.
+        runtime = self.live(self.status("013"))
+        result = call(runtime.service, "list_filings", {"corp_code": CORP, "from": "2025-01-01", "to": "2025-12-31"})
+        self.assertEqual(result["data"], [])
+        result = call(runtime.service, "get_financial_statements", {"corp_code": CORP, "bsns_year": "2025"})
+        self.assertEqual(result["data"], {"status": "blocked", "error": "financials-no-data"})
 
     def test_transport_and_shape_failures(self):
         cases = (
@@ -259,6 +394,9 @@ class DartAdapterCodeTests(IsolatedCase):
             (httpx.Response(200, content=b"<?xml version='1.0'?><result><status>010</status><message>synthetic</message></result>"),
              ("unavailable", "dart-auth-failed")),
             (httpx.Response(200, json={"status": "020", "message": "synthetic"}), ("unavailable", "dart-rate-limited")),
+            (httpx.Response(200, content=b"<result><status>014</status></result>"), ("blocked", "dart-no-data")),
+            (httpx.Response(200, content=b"<result><status>800</status></result>"), ("unavailable", "dart-maintenance")),
+            (httpx.Response(200, content=b"<result><status>000</status></result>"), ("blocked", "dart-response-invalid")),
             (httpx.Response(200, content=b"not a zip archive"), ("blocked", "dart-response-invalid")),
             (httpx.Response(503, content=b""), ("unavailable", "dart-request-failed")),
         )
@@ -271,6 +409,69 @@ class DartAdapterCodeTests(IsolatedCase):
                 result = call(self.live(handler).service, "resolve_symbol", {"query": "가상회사"})
                 self.assertEqual(result["data"], {"status": expected[0], "error": expected[1]})
                 self.assert_no_secrets(repr(result))
+
+    def test_unreadable_local_index_is_internal_error_without_a_request(self):
+        runtime = self.live(None)
+        runtime.corp_index.replace([CorpCodeRecord(CORP, "가상회사", "000001", "20990101")], refreshed_at="not-a-timestamp")
+        result = call(runtime.service, "resolve_symbol", {"query": "가상회사"})
+        self.assertEqual(result["data"], {"status": "unavailable", "error": "internal-error"})
+        self.assertEqual(self.requests, [])
+
+    def document_runtime(self, response):
+        """A runtime whose list.json knows one synthetic annual report and whose document.xml answers ``response``."""
+
+        def handler(request):
+            if request.url.path == "/api/list.json":
+                return httpx.Response(200, json={
+                    "status": "000", "page_no": 1, "page_count": 100, "total_count": 1, "total_page": 1,
+                    "list": [{"corp_code": CORP, "rcept_no": RCEPT, "rcept_dt": "20990331", "report_nm": "사업보고서 (2098.12)"}],
+                })
+            self.assertEqual(request.url.path, "/api/document.xml")
+            return response
+
+        runtime = self.live(handler)
+        listed = call(runtime.service, "list_filings", {"corp_code": CORP, "from": "2099-01-01", "to": "2099-12-31"})
+        self.assertEqual([item["rcept_no"] for item in listed["data"]], [RCEPT])
+        return runtime
+
+    def test_document_status_body_maps_to_its_dart_code(self):
+        cases = (
+            (httpx.Response(200, content=b"<?xml version='1.0' encoding='UTF-8'?><result><status>010</status><message>synthetic</message></result>"),
+             ("unavailable", "dart-auth-failed")),
+            (httpx.Response(200, json={"status": "020", "message": "synthetic"}), ("unavailable", "dart-rate-limited")),
+            (httpx.Response(200, content=b"<result><status>013</status></result>"), ("blocked", "dart-no-data")),
+            (httpx.Response(200, content=b"<result><status>014</status><message>synthetic</message></result>"), ("blocked", "dart-no-data")),
+            (httpx.Response(200, content=b"<result><status>100</status></result>"), ("blocked", "dart-request-invalid")),
+            (httpx.Response(200, content=b"<result><status>800</status></result>"), ("unavailable", "dart-maintenance")),
+            (httpx.Response(200, content=b"<result><status>900</status></result>"), ("unavailable", "dart-request-failed")),
+            # No readable error status: the archive checks reject it, as upstream does.
+            (httpx.Response(200, content=b"<result><status>000</status></result>"), ("blocked", "filing-archive-invalid")),
+            (httpx.Response(200, content=b"not a zip and no status"), ("blocked", "filing-archive-invalid")),
+            (httpx.Response(503, content=b""), ("unavailable", "dart-request-failed")),
+        )
+        for response, (status, code) in cases:
+            with self.subTest(code=code, body=response.content[:40]):
+                runtime = self.document_runtime(response)
+                for name, arguments in (
+                    ("get_filing_document", {"rcept_no": RCEPT}),
+                    ("get_filing_section", {"rcept_no": RCEPT, "section": "사업의 내용"}),
+                ):
+                    result = call(runtime.service, name, arguments)
+                    self.assertEqual(result["data"], {"status": status, "error": code}, name)
+                    self.assert_no_secrets(repr(result))
+
+    def test_file_endpoint_014_is_no_data_and_keeps_its_status(self):
+        body = b"<result><status>014</status><message>synthetic</message></result>"
+        client = DartReadonlyClient(DART_KEY, http_client=self.mock_client(lambda request: httpx.Response(200, content=body)))
+        with self.assertRaises(DartNoData) as caught:
+            client.get_document(RCEPT)
+        self.assertEqual(caught.exception.status, "014")
+        self.assertNotIn(DART_KEY, str(caught.exception))
+        client = DartReadonlyClient(DART_KEY, http_client=self.mock_client(
+            lambda request: httpx.Response(200, json={"status": "020", "message": "synthetic"})))
+        with self.assertRaises(DartRateLimited) as caught:
+            client.get_document(RCEPT)
+        self.assertEqual(caught.exception.status, "020")
 
     def test_blank_symbol_query_is_invalid_argument(self):
         from datetime import datetime, timezone
@@ -314,6 +515,38 @@ class DartAdapterCodeTests(IsolatedCase):
         self.assertEqual(self.requests, [])
 
 
+class DartStatusAttributeTests(unittest.TestCase):
+    """Exceptions keep the raw DART status they saw; an explicit None stays None."""
+
+    def test_class_defaults_and_explicit_values(self):
+        self.assertEqual(DartNoData("x").status, "013")
+        self.assertIsNone(DartNoData("x", status=None).status)
+        self.assertEqual(DartNoData("x", status="014").status, "014")
+        self.assertIsNone(DartLiveError("x").status)
+        self.assertIsNone(DartResponseError("x").status)
+        self.assertEqual(str(DartNoData("synthetic message", status="014")), "synthetic message")
+
+    def test_raise_for_dart_status_keeps_the_status_it_read(self):
+        raise_for_dart_status("000")
+        for status, error in (("010", DartAuthError), ("013", DartNoData), ("014", DartResponseError),
+                              ("020", DartRateLimited), ("021", DartRequestRejected), ("800", DartMaintenance)):
+            with self.subTest(status=status), self.assertRaises(error) as caught:
+                raise_for_dart_status(status)
+            self.assertEqual(caught.exception.status, status)
+        with self.assertRaises(DartLiveError) as caught:
+            raise_for_dart_status("900")
+        self.assertIs(type(caught.exception), DartLiveError)
+        self.assertEqual(caught.exception.status, "900")
+
+    def test_unreadable_status_is_reported_as_unknown(self):
+        for raw in (None, 13, "x" * 20, "\uff10\uff11\uff13", ["013"]):
+            with self.subTest(raw=raw), self.assertRaises(DartLiveError) as caught:
+                raise_for_dart_status(raw)
+            self.assertIs(type(caught.exception), DartLiveError)
+            self.assertEqual(caught.exception.status, "unknown")
+            self.assertIn("status=unknown", str(caught.exception))
+
+
 class GrowthBaseTests(unittest.TestCase):
     """YoY는 양수 기준값에서만 백분율을 낸다."""
 
@@ -322,7 +555,7 @@ class GrowthBaseTests(unittest.TestCase):
         return entry
 
     def test_negative_and_zero_previous_values_have_no_number(self):
-        for previous, current in (("-100", "-200"), ("-100", "-50"), ("0", "100"), ("0", "-100"), ("-100", "0")):
+        for previous, current in (("-100", "-200"), ("-100", "-50"), ("0", "100"), ("0", "-100"), ("-100", "0"), ("0", "0")):
             with self.subTest(previous=previous, current=current):
                 entry = self.yoy(previous, current)
                 self.assertEqual(entry["status"], "unavailable")
@@ -335,6 +568,9 @@ class GrowthBaseTests(unittest.TestCase):
         self.assertNotIn("value", entry)
         entry = self.yoy("100", "-50")
         self.assertEqual((entry["status"], entry["value"], entry["sign_change"]), ("ok", "-1.5", "positive-to-negative"))
+        for previous, current in (("100", "0"), ("0", "100"), ("-100", "-50"), ("100", "150")):
+            with self.subTest(previous=previous, current=current):
+                self.assertNotIn("sign_change", self.yoy(previous, current))
 
     def test_positive_base_unchanged(self):
         self.assertEqual(self.yoy("100", "150"), {"from_period": "2024", "to_period": "2025", "status": "ok", "value": "0.5"})
@@ -346,6 +582,19 @@ class GrowthBaseTests(unittest.TestCase):
         result = call(ToolService({"growth_metrics": lambda **a: growth_metrics(a["series"], a["periods"])}),
                       "growth_metrics", {"series": ["-100", "-200"], "periods": ["2024", "2025"]})
         self.assertEqual(result["data"]["yoy"][0]["reason"], "nonpositive-previous-value")
+
+    def test_formula_version_matches_the_upstream_rule(self):
+        # 1.1 is the upstream label for "no YoY on a non-positive base, plus sign_change".
+        self.assertEqual(GROWTH_FORMULA_VERSION, "1.1")
+        self.assertEqual(TOOL_REGISTRY["growth_metrics"].reference_value, f"growth-metrics:{GROWTH_FORMULA_VERSION}")
+        result = call(ToolService({"growth_metrics": lambda **a: growth_metrics(a["series"], a["periods"])}),
+                      "growth_metrics", {"series": ["-100", "-200", "50"], "periods": ["2023", "2024", "2025"]})
+        self.assertEqual(result["data"]["formula_version"], GROWTH_FORMULA_VERSION)
+        self.assertEqual(result["reference"]["value"], f"growth-metrics:{GROWTH_FORMULA_VERSION}")
+        first, second = result["data"]["yoy"]
+        self.assertEqual((first["status"], first["reason"]), ("unavailable", "nonpositive-previous-value"))
+        self.assertEqual((second["status"], second["sign_change"]), ("unavailable", "negative-to-positive"))
+        self.assertNotIn("value", second)
 
 
 class HttpLoggingTests(unittest.TestCase):

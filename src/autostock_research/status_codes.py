@@ -4,9 +4,11 @@ Runtime modules import values from here instead of inventing adjacent
 spellings.  ``ToolService`` turns a handler failure into an envelope with the
 exception's ``code`` only when that code is registered in ``ERROR_CODES``; any
 other failure becomes ``internal-error``.  Codes in ``UNAVAILABLE_CODES`` mean
-the source could not be reached or refused the caller (envelope status
-``unavailable``); every other code means the server declined to return data it
-could not verify (status ``blocked``).
+the environment failed or the request may succeed on retry (credentials, rate
+limits, maintenance, transport, server faults): envelope status
+``unavailable``.  Every other code means the server declined to return data it
+could not verify or was asked for something it cannot serve (no data, bad
+arguments, contract or identity violations): envelope status ``blocked``.
 """
 
 from __future__ import annotations
@@ -18,14 +20,15 @@ class ErrorCode(str, Enum):
     # Caller arguments that pass the input schema but cannot be served.
     INVALID_ARGUMENT = "invalid-argument"
 
-    # OpenDART transport and business statuses.
-    DART_NO_DATA = "dart-no-data"
-    DART_AUTH_FAILED = "dart-auth-failed"
-    DART_RATE_LIMITED = "dart-rate-limited"
-    DART_REQUEST_INVALID = "dart-request-invalid"
-    DART_MAINTENANCE = "dart-maintenance"
-    DART_RESPONSE_INVALID = "dart-response-invalid"
-    DART_REQUEST_FAILED = "dart-request-failed"
+    # OpenDART transport and business statuses.  None of these carries the
+    # request URL or the key.
+    DART_NO_DATA = "dart-no-data"  # status 013; 014 on file endpoints only
+    DART_AUTH_FAILED = "dart-auth-failed"  # status 010, 011, 012, 901
+    DART_RATE_LIMITED = "dart-rate-limited"  # status 020
+    DART_REQUEST_INVALID = "dart-request-invalid"  # status 021, 100, 101
+    DART_MAINTENANCE = "dart-maintenance"  # status 800
+    DART_RESPONSE_INVALID = "dart-response-invalid"  # shape or contract; 014 on JSON endpoints
+    DART_REQUEST_FAILED = "dart-request-failed"  # transport, HTTP, any other status
 
     # Toss Securities transport and response contract.
     TOSS_AUTH_FAILED = "toss-auth-failed"

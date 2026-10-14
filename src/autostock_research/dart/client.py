@@ -12,22 +12,37 @@ from ..status_codes import ErrorCode
 
 
 DART_API_BASE = "https://opendart.fss.or.kr/api"
+_STATUS_UNSET = object()
 
 
 class DartLiveError(RuntimeError):
-    """요청 URL과 인증키를 노출하지 않는 DART 오류. 연결·HTTP·미정의 상태."""
+    """요청 URL과 인증키를 노출하지 않는 DART 오류. 연결·HTTP·미정의 업무 상태.
+
+    DART 업무 상태를 읽은 경우 ``status``에 원래 세 자리 값을 남긴다. ``status``를
+    넘기지 않으면 클래스 기본값을 쓰고, ``None``을 넘기면 "단일 상태 없음"으로 그대로
+    ``None``이 된다.
+    """
 
     code = ErrorCode.DART_REQUEST_FAILED
+    status: str | None = None
+
+    def __init__(self, *args: object, status: str | None | object = _STATUS_UNSET) -> None:
+        super().__init__(*args)
+        if status is not _STATUS_UNSET:
+            self.status = status  # type: ignore[assignment]
 
 
 class DartNoData(DartLiveError):
-    """조회 조건에 맞는 데이터가 없다 (업무 상태 013, 014).
+    """조회 조건에 맞는 데이터가 없다 (JSON 업무 상태 013, 파일 엔드포인트의 013·014).
 
     "아직 공시되지 않은 보고서"를 인증 오류·서버 오류와 구분해야 한다.
     뭉뚱그리면 키가 틀린 것도 "없음"으로 처리돼 조용히 잘못된 결론이 난다.
+    JSON 엔드포인트에서 이 오류가 되는 상태는 013뿐이므로 ``status`` 기본값은
+    ``"013"``이다.
     """
 
     code = ErrorCode.DART_NO_DATA
+    status: str | None = "013"
 
 
 class DartAuthError(DartLiveError):
@@ -60,36 +75,67 @@ class DartResponseError(DartLiveError):
     code = ErrorCode.DART_RESPONSE_INVALID
 
 
-_STATUS_ERRORS: dict[str, tuple[type[DartLiveError], str]] = {
+_StatusTable = dict[str, tuple[type[DartLiveError], str]]
+
+_COMMON_STATUS_ERRORS: _StatusTable = {
     "010": (DartAuthError, "등록되지 않은 DART 키입니다"),
     "011": (DartAuthError, "사용할 수 없는 DART 키입니다"),
     "012": (DartAuthError, "DART에 접근할 수 없는 IP입니다"),
     "901": (DartAuthError, "보유기간이 만료되어 사용할 수 없는 DART 키입니다"),
     "013": (DartNoData, "DART 조회 조건에 맞는 데이터가 없습니다"),
-    "014": (DartNoData, "DART 파일이 존재하지 않습니다"),
     "020": (DartRateLimited, "DART 요청 제한을 초과했습니다"),
     "021": (DartRequestRejected, "DART 조회 가능한 회사 개수를 초과했습니다"),
     "100": (DartRequestRejected, "DART 요청 필드 값이 부적절합니다"),
     "101": (DartRequestRejected, "DART 접근 방식이 부적절합니다"),
     "800": (DartMaintenance, "DART 시스템 점검 중입니다"),
 }
-
+# 014("파일이 존재하지 않습니다")는 파일 엔드포인트(document.xml, corpCode.xml)의 상태다.
+# JSON 엔드포인트가 이를 돌려주면 계약 밖 응답이므로 "데이터 없음"으로 건너뛰지
+# 않고 응답 오류로 막는다. 그래야 공시검색이 빈 목록을 정상으로 돌려주거나
+# 재무제표가 "공시 없음"으로 보고되지 않는다.
+_JSON_STATUS_ERRORS: _StatusTable = {
+    **_COMMON_STATUS_ERRORS,
+    "014": (DartResponseError, "DART JSON 엔드포인트가 파일 엔드포인트 상태를 돌려줬습니다"),
+}
+_FILE_STATUS_ERRORS: _StatusTable = {
+    **_COMMON_STATUS_ERRORS,
+    "014": (DartNoData, "DART 파일이 존재하지 않습니다"),
+}
 
 _BODY_STATUS = re.compile(rb'<status>\s*([0-9]{3})\s*</status>|"status"\s*:\s*"([0-9]{3})"')
 
 
+def raise_for_dart_status(status: object, *, table: _StatusTable = _JSON_STATUS_ERRORS) -> None:
+    """DART 업무 상태 코드를 해당 오류로 바꾼다. ``000``이면 그냥 돌아간다.
+
+    기본 표는 JSON 엔드포인트용이다. 파일 엔드포인트의 상태 본문은
+    :func:`raise_for_status_body`가 파일용 표로 읽는다.
+    """
+
+    if status == "000":
+        return
+    if isinstance(status, str) and status in table:
+        error, message = table[status]
+        raise error(f"{message} (status={status})", status=status)
+    safe_status = status if isinstance(status, str) and status.isascii() and len(status) <= 8 else "unknown"
+    raise DartLiveError(f"DART API 업무 오류: status={safe_status}", status=safe_status)
+
+
 def raise_for_status_body(body: bytes) -> None:
-    """ZIP 대신 온 짧은 오류 본문(XML 또는 JSON)에서 DART 업무 상태를 읽어 해당 오류를 낸다."""
+    """ZIP 대신 온 짧은 오류 본문(XML 또는 JSON)에서 DART 업무 상태를 읽어 오류를 낸다.
+
+    ``document.xml``과 ``corpCode.xml``은 키 오류·요청 제한·파일 없음(014)을 ZIP이
+    아닌 상태 본문으로 돌려준다. 상태를 읽지 못하면 아무것도 하지 않으므로, 호출자는
+    이어서 ZIP 검증으로 실패를 확정해야 한다. ``000``도 그대로 돌아간다.
+    """
 
     match = _BODY_STATUS.search(body[:4096])
     if match is None:
         return
-    status = (match.group(1) or match.group(2)).decode("ascii")
-    if status in _STATUS_ERRORS:
-        error, message = _STATUS_ERRORS[status]
-        raise error(f"{message} (status={status})")
-    if status != "000":
-        raise DartLiveError(f"DART API 업무 오류: status={status}")
+    raise_for_dart_status(
+        (match.group(1) or match.group(2)).decode("ascii"),
+        table=_FILE_STATUS_ERRORS,
+    )
 
 
 class DartReadonlyClient:
@@ -215,6 +261,11 @@ class DartReadonlyClient:
         payload = response.content
         if not payload or len(payload) > 20_000_000:
             raise DartResponseError("DART filing document size is outside the safe range")
+        if not payload.startswith(b"PK"):
+            # A bad key, rate limit or missing file comes back as a short status
+            # body instead of a ZIP.  Anything else falls through to the archive
+            # checks, which reject it as filing-archive-invalid.
+            raise_for_status_body(payload)
         return payload
 
     def list_disclosures(
@@ -353,13 +404,7 @@ class DartReadonlyClient:
             raise DartResponseError("DART API 응답이 JSON이 아닙니다") from exc
         if not isinstance(payload, Mapping):
             raise DartResponseError("DART API 응답 최상위 값이 객체가 아닙니다")
-        status = payload.get("status")
-        if isinstance(status, str) and status in _STATUS_ERRORS:
-            error, message = _STATUS_ERRORS[status]
-            raise error(f"{message} (status={status})")
-        if status != "000":
-            safe_status = status if isinstance(status, str) else "unknown"
-            raise DartLiveError(f"DART API 업무 오류: status={safe_status}")
+        raise_for_dart_status(payload.get("status"))
         return payload
 
     def _get_list(

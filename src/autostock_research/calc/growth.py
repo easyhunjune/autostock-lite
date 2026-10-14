@@ -9,7 +9,7 @@ from typing import Sequence
 from ..status_codes import ErrorCode
 
 
-GROWTH_FORMULA_VERSION = "1.0"
+GROWTH_FORMULA_VERSION = "1.1"
 _YEAR = re.compile(r"^\d{4}$")
 
 
@@ -79,7 +79,9 @@ def growth_metrics(
     YoY is a percentage change only against a positive previous value.  A zero
     or negative base gives no number (``nonpositive-previous-value``): dividing
     by a negative base flips the sign, so -100 -> -200 would read as +100%.
-    A sign change is labelled with ``sign_change`` instead.
+    A sign change between consecutive years is labelled in ``sign_change``
+    (``negative-to-positive`` or ``positive-to-negative``); the number is kept
+    only when the base is positive.
     """
 
     if len(series) != len(periods) or not series:
