@@ -30,8 +30,8 @@ Codex 같은 MCP 클라이언트에 연결하면 "삼성물산 최근 3년 매�
 
 ## 설치
 
-이 저장소를 내려받아 압축을 푼 폴더에서 아래 명령을 실행합니다.
-전용 가상환경을 만들고 그 안에 설치하는 방식입니다.
+[저장소 페이지](https://github.com/easyhunjune/autostock-lite)에서 Code > Download ZIP으로 내려받아 압축을 풀거나, git이 있으면 `git clone https://github.com/easyhunjune/autostock-lite.git`으로 받습니다.
+그 폴더에서 아래 명령을 실행합니다. 전용 가상환경을 만들고 그 안에 설치하는 방식입니다.
 
 Windows (PowerShell):
 
