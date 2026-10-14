@@ -18,21 +18,21 @@ from mcp import ClientSession, types
 from mcp.shared.exceptions import MCPError
 from mcp.shared.memory import create_client_server_memory_streams
 
-import autostock_research
-from autostock_research import paths
-from autostock_research.cli import build_parser, doctor
-from autostock_research.config import (
+import autostock_lite
+from autostock_lite import paths
+from autostock_lite.cli import build_parser, doctor
+from autostock_lite.config import (
     ConfigError,
     ResearchSettings,
     collect_config_values,
     load_settings,
 )
-from autostock_research.dart.corp_code import CorpCodeRecord
-from autostock_research.mcp_runtime import create_live_runtime, run_live_stdio
-from autostock_research.mcp_server import (
+from autostock_lite.dart.corp_code import CorpCodeRecord
+from autostock_lite.mcp_runtime import create_live_runtime, run_live_stdio
+from autostock_lite.mcp_server import (
     SERVER_INSTRUCTIONS, TOOL_REGISTRY, UnknownToolError, create_mcp_server,
 )
-from autostock_research.toss.session_lock import TossSessionBusy, TossSessionLock
+from autostock_lite.toss.session_lock import TossSessionBusy, TossSessionLock
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -129,10 +129,10 @@ class PackageAndPathsTests(IsolatedCase):
     def test_package_import_is_from_this_repository(self):
         # 저장소에서 바로 돌릴 때(개발 실행·editable 설치)만 확인한다.
         # 일반 pip install로 site-packages에서 불러오는 경우는 정상이므로 건너뛴다.
-        location = Path(autostock_research.__file__).resolve()
+        location = Path(autostock_lite.__file__).resolve()
         if not location.is_relative_to((ROOT / "src").resolve()):
             self.skipTest(f"installed package outside this checkout: {location}")
-        self.assertEqual(location, (ROOT / "src" / "autostock_research" / "__init__.py").resolve())
+        self.assertEqual(location, (ROOT / "src" / "autostock_lite" / "__init__.py").resolve())
 
     def test_injected_platform_paths_and_fallbacks(self):
         home = self.root / "injected-home"
@@ -667,7 +667,7 @@ class DoctorLockTests(IsolatedCase):
         holder = subprocess.Popen(
             [sys.executable, "-c", (
                 "import sys\n"
-                "from autostock_research.toss.session_lock import TossSessionLock\n"
+                "from autostock_lite.toss.session_lock import TossSessionLock\n"
                 "with TossSessionLock(sys.argv[1], timeout=0):\n"
                 "    print('locked', flush=True)\n"
                 "    sys.stdin.read()\n"

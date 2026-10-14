@@ -13,34 +13,34 @@ from unittest.mock import patch
 
 import httpx
 
-import autostock_research
-from autostock_research import cli
-from autostock_research.calc.growth import GROWTH_FORMULA_VERSION, growth_metrics
-from autostock_research.dart.client import (
+import autostock_lite
+from autostock_lite import cli
+from autostock_lite.calc.growth import GROWTH_FORMULA_VERSION, growth_metrics
+from autostock_lite.dart.client import (
     DartAuthError, DartLiveError, DartMaintenance, DartNoData, DartRateLimited,
     DartReadonlyClient, DartRequestRejected, DartResponseError, raise_for_dart_status,
 )
-from autostock_research.dart.corp_code import (
+from autostock_lite.dart.corp_code import (
     CorpCodeDownloadError, CorpCodeError, CorpCodeIndexError, CorpCodeRecord,
 )
-from autostock_research.dart.filings import (
+from autostock_lite.dart.filings import (
     FilingArchiveError, FilingArgumentError, FilingEncodingError, FilingError,
     FilingSchemaError, FilingSection,
 )
-from autostock_research.dart.ownership import OwnershipError, OwnershipSchemaError
-from autostock_research.mcp_runtime import FilingContextError
-from autostock_research.mcp_server import TOOL_REGISTRY, ToolArgumentsError, ToolService
-from autostock_research.provenance import MASK
-from autostock_research.status_codes import (
+from autostock_lite.dart.ownership import OwnershipError, OwnershipSchemaError
+from autostock_lite.mcp_runtime import FilingContextError
+from autostock_lite.mcp_server import TOOL_REGISTRY, ToolArgumentsError, ToolService
+from autostock_lite.provenance import MASK
+from autostock_lite.status_codes import (
     ERROR_CODES, UNAVAILABLE_CODES, ErrorCode, InvalidArgumentError,
 )
-from autostock_research.toss.auth import TossAuthError, TossIpNotAllowed
-from autostock_research.toss.live import TossLiveError, TossLiveIpNotAllowed, TossRateLimited
-from autostock_research.toss.models import StrictModelError
+from autostock_lite.toss.auth import TossAuthError, TossIpNotAllowed
+from autostock_lite.toss.live import TossLiveError, TossLiveIpNotAllowed, TossRateLimited
+from autostock_lite.toss.models import StrictModelError
 from test_smoke import DART_KEY, ROOT, TOSS_SECRET, IsolatedCase
 
 
-SRC = ROOT / "src" / "autostock_research"
+SRC = ROOT / "src" / "autostock_lite"
 RCEPT = "20990331000001"
 CORP = "99000001"
 
@@ -198,7 +198,7 @@ class RedactionTighteningTests(unittest.TestCase):
 
 
 def _iter_modules():
-    for info in pkgutil.walk_packages(autostock_research.__path__, prefix="autostock_research."):
+    for info in pkgutil.walk_packages(autostock_lite.__path__, prefix="autostock_lite."):
         yield importlib.import_module(info.name)
 
 
@@ -251,7 +251,7 @@ class ErrorCodeRegistryTests(unittest.TestCase):
         checked = 0
         for module in _iter_modules():
             for _, cls in inspect.getmembers(module, inspect.isclass):
-                if issubclass(cls, BaseException) and cls.__module__.startswith("autostock_research") and hasattr(cls, "code"):
+                if issubclass(cls, BaseException) and cls.__module__.startswith("autostock_lite") and hasattr(cls, "code"):
                     code = cls.code.value if isinstance(cls.code, ErrorCode) else cls.code
                     with self.subTest(cls=f"{cls.__module__}.{cls.__name__}"):
                         self.assertIn(code, ERROR_CODES)
@@ -302,7 +302,7 @@ class DartAdapterCodeTests(IsolatedCase):
     """mock HTTP로 DART 업무 상태가 서로 다른 코드로 나오는지 확인한다."""
 
     def live(self, handler, *, toss=False):
-        from autostock_research.mcp_runtime import create_live_runtime
+        from autostock_lite.mcp_runtime import create_live_runtime
 
         runtime = create_live_runtime(self.settings(toss=toss), http_client=self.mock_client(handler), state_dir=self.root / "state")
         self.addCleanup(runtime.close)
@@ -475,7 +475,7 @@ class DartAdapterCodeTests(IsolatedCase):
 
     def test_blank_symbol_query_is_invalid_argument(self):
         from datetime import datetime, timezone
-        from autostock_research.dart.corp_code import CorpCodeRecord
+        from autostock_lite.dart.corp_code import CorpCodeRecord
 
         runtime = self.live(None)
         runtime.corp_index.replace([CorpCodeRecord(CORP, "가상회사", "000001", "20260101")],

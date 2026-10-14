@@ -6,17 +6,17 @@ import inspect
 
 import httpx
 
-from autostock_research.dart.client import DartLiveError, DartNoData, DartReadonlyClient
-from autostock_research.dart.corp_code import CorpCodeIndex, CorpCodeRecord
-from autostock_research.mcp_runtime import create_live_runtime
-from autostock_research.symbols import (
+from autostock_lite.dart.client import DartLiveError, DartNoData, DartReadonlyClient
+from autostock_lite.dart.corp_code import CorpCodeIndex, CorpCodeRecord
+from autostock_lite.mcp_runtime import create_live_runtime
+from autostock_lite.symbols import (
     DartListingClassifier, ListingStatusUnavailable, SymbolResolver,
 )
-from autostock_research.toss import live
-from autostock_research.toss.client import (
+from autostock_lite.toss import live
+from autostock_lite.toss.client import (
     DEFAULT_TPS, OPERATION_CONTRACTS, Operation, RateLimitGroup, TossMarketData,
 )
-from autostock_research.toss.models import StockInfo
+from autostock_lite.toss.models import StockInfo
 from test_smoke import IsolatedCase
 
 
@@ -227,7 +227,7 @@ class SymbolTests(IsolatedCase):
             }]})
 
         # 유효한 토큰을 미리 공급하는 대신 시장 객체의 공개 reader 주입점을 사용한다.
-        from autostock_research.mcp_runtime import McpRuntime
+        from autostock_lite.mcp_runtime import McpRuntime
 
         class Clock:
             def now(self):

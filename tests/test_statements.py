@@ -9,8 +9,8 @@ import unittest
 
 import httpx
 
-from autostock_research.dart.client import DartNoData
-from autostock_research.dart.statements import (
+from autostock_lite.dart.client import DartNoData
+from autostock_lite.dart.statements import (
     UNIT_NOTE,
     StatementsDateUnavailable,
     StatementsIdentityError,
@@ -18,8 +18,8 @@ from autostock_research.dart.statements import (
     StatementsSchemaError,
     get_financial_statements,
 )
-from autostock_research.mcp_runtime import create_live_runtime
-from autostock_research.mcp_server import TOOL_REGISTRY, ToolArgumentsError, ToolService
+from autostock_lite.mcp_runtime import create_live_runtime
+from autostock_lite.mcp_server import TOOL_REGISTRY, ToolArgumentsError, ToolService
 from test_smoke import IsolatedCase
 
 

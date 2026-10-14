@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-autostock-lite = "autostock_research.cli:main"
+autostock-lite = "autostock_lite.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
